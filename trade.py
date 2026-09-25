@@ -465,13 +465,7 @@ def main():
         MIN_TF_CONFIRMATIONS,
     )
 
-    while True:
-        started = time.time()
-        scan_once()
-        elapsed = time.time() - started
-        sleep_for = max(5, SCAN_EVERY_SECONDS - elapsed)
-        log.info("Next scan in %.0f seconds.", sleep_for)
-        time.sleep(sleep_for)
+    scan_once()
 
 
 if __name__ == "__main__":
