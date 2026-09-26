@@ -1,11 +1,11 @@
-
 import os
 import time
-import json
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
 import requests
+from requests.adapters import HTTPAdapter, Retry
 import pandas as pd
 from dotenv import load_dotenv
 
@@ -46,17 +46,20 @@ MIN_CONFIRMATIONS = 2
 # At least 2 timeframes must agree.
 MIN_TF_CONFIRMATIONS = 2
 
-# Polling interval. 300 seconds = 5 minutes.
+# Polling interval. 300 seconds = 5 minutes (used only if run in a loop).
 SCAN_EVERY_SECONDS = 300
 
 # How many candles to request. 150 is enough for the standard Ichimoku.
 CANDLE_LIMIT = 150
 
-# Send only when the final signal changes, unless SEND_NEUTRAL is enabled.
-SEND_NEUTRAL = False
-
-STATE_FILE = "state.json"
+# NOTE: change-detection was removed on purpose — every scan sends a
+# fresh Telegram message for every symbol, regardless of the previous run.
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+
+# How many symbols/timeframes to fetch in parallel. KuCoin's public
+# endpoint tolerates a modest amount of concurrency; keep this conservative
+# to avoid rate-limit errors (429s).
+MAX_WORKERS = 6
 
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
@@ -78,29 +81,38 @@ if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
 
 
 # =========================
-# STATE
+# HTTP SESSION (connection reuse + automatic retries)
 # =========================
-def load_state():
-    try:
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
+def build_session():
+    session = requests.Session()
+    retries = Retry(
+        total=3,
+        backoff_factor=0.5,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET", "POST"],
+    )
+    adapter = HTTPAdapter(max_retries=retries, pool_maxsize=MAX_WORKERS + 2)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
 
 
-def save_state(state):
-    tmp = STATE_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(state, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, STATE_FILE)
-
-
-state = load_state()
+SESSION = build_session()
 
 
 # =========================
 # KUCOIN
 # =========================
+def interval_to_seconds(interval):
+    mapping = {
+        "15min": 15 * 60,
+        "1hour": 60 * 60,
+        "4hour": 4 * 60 * 60,
+        "1day": 24 * 60 * 60,
+    }
+    return mapping[interval]
+
+
 def fetch_klines(symbol, interval):
     """
     KuCoin UTA V2 public Kline endpoint.
@@ -114,7 +126,7 @@ def fetch_klines(symbol, interval):
         "interval": interval,
     }
 
-    r = requests.get(KUCOIN_URL, params=params, timeout=15)
+    r = SESSION.get(KUCOIN_URL, params=params, timeout=15)
     r.raise_for_status()
     payload = r.json()
 
@@ -128,7 +140,7 @@ def fetch_klines(symbol, interval):
         raise RuntimeError(f"No kline data for {symbol} {interval}")
 
     # KuCoin can return newest first; normalize to oldest -> newest.
-    rows = sorted(rows, key=lambda x: int(x[0]))
+    rows.sort(key=lambda x: int(x[0]))
 
     df = pd.DataFrame(
         rows,
@@ -148,7 +160,6 @@ def fetch_klines(symbol, interval):
     df = df.drop_duplicates(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
 
     # Remove the currently forming candle.
-    # A candle is considered closed when its timestamp + timeframe duration <= now.
     seconds = interval_to_seconds(interval)
     now = pd.Timestamp.now(tz="UTC")
     df = df[(df["timestamp"] + pd.Timedelta(seconds=seconds)) <= now].copy()
@@ -161,123 +172,85 @@ def fetch_klines(symbol, interval):
     return df.tail(CANDLE_LIMIT).reset_index(drop=True)
 
 
-def interval_to_seconds(interval):
-    mapping = {
-        "15min": 15 * 60,
-        "1hour": 60 * 60,
-        "4hour": 4 * 60 * 60,
-        "1day": 24 * 60 * 60,
-    }
-    return mapping[interval]
-
-
 # =========================
-# ICHIMOKU
+# ICHIMOKU (vectorized, computed once per dataframe)
 # =========================
 def ichimoku(df):
     high = df["high"]
     low = df["low"]
     close = df["close"]
 
-    tenkan = (
-        high.rolling(TENKAN).max() + low.rolling(TENKAN).min()
-    ) / 2
+    tenkan = (high.rolling(TENKAN).max() + low.rolling(TENKAN).min()) / 2
+    kijun = (high.rolling(KIJUN).max() + low.rolling(KIJUN).min()) / 2
+    span_a = (tenkan + kijun) / 2
+    span_b = (high.rolling(SENKOU_B).max() + low.rolling(SENKOU_B).min()) / 2
 
-    kijun = (
-        high.rolling(KIJUN).max() + low.rolling(KIJUN).min()
-    ) / 2
-
-    senkou_a_raw = (tenkan + kijun) / 2
-
-    senkou_b_raw = (
-        high.rolling(SENKOU_B).max() + low.rolling(SENKOU_B).min()
-    ) / 2
-
-    return {
-        "close": close,
-        "high": high,
-        "low": low,
-        "tenkan": tenkan,
-        "kijun": kijun,
-        "span_a": senkou_a_raw,
-        "span_b": senkou_b_raw,
-    }
+    return pd.DataFrame(
+        {
+            "close": close,
+            "tenkan": tenkan,
+            "kijun": kijun,
+            "span_a": span_a,
+            "span_b": span_b,
+        }
+    )
 
 
 def analyze_timeframe(df):
     x = ichimoku(df)
     i = len(df) - 1
 
-    # Current cloud uses values whose standard chart display is shifted forward.
-    # For a signal at the current closed candle, compare current price with the
-    # current computed Kumo values.
     tenkan = x["tenkan"].iloc[i]
     kijun = x["kijun"].iloc[i]
     span_a = x["span_a"].iloc[i]
     span_b = x["span_b"].iloc[i]
     close = x["close"].iloc[i]
 
-    if any(pd.isna(v) for v in [tenkan, kijun, span_a, span_b, close]):
+    if any(pd.isna(v) for v in (tenkan, kijun, span_a, span_b, close)):
         return {"signal": "NEUTRAL", "confirmations": [], "price": float(close)}
 
     cloud_top = max(span_a, span_b)
     cloud_bottom = min(span_a, span_b)
 
-    confirmations_bull = []
-    confirmations_bear = []
+    bull, bear = [], []
 
-    # 1) Price vs Kumo
     if close > cloud_top:
-        confirmations_bull.append("Price > Kumo")
+        bull.append("Price > Kumo")
     elif close < cloud_bottom:
-        confirmations_bear.append("Price < Kumo")
+        bear.append("Price < Kumo")
 
-    # 2) Tenkan vs Kijun
     if tenkan > kijun:
-        confirmations_bull.append("Tenkan > Kijun")
+        bull.append("Tenkan > Kijun")
     elif tenkan < kijun:
-        confirmations_bear.append("Tenkan < Kijun")
+        bear.append("Tenkan < Kijun")
 
-    # 3) Kumo direction
     if span_a > span_b:
-        confirmations_bull.append("Bullish Kumo")
+        bull.append("Bullish Kumo")
     elif span_a < span_b:
-        confirmations_bear.append("Bearish Kumo")
+        bear.append("Bearish Kumo")
 
-    # 4) Chikou confirmation.
-    # Chikou at the current point is today's close plotted 26 candles back.
-    # We compare that historical close against the historical price/cloud area.
     if i >= DISPLACEMENT + SENKOU_B:
         chikou_value = x["close"].iloc[i - DISPLACEMENT]
         hist_price = x["close"].iloc[i - 2 * DISPLACEMENT]
         hist_a = x["span_a"].iloc[i - 2 * DISPLACEMENT]
         hist_b = x["span_b"].iloc[i - 2 * DISPLACEMENT]
 
-        hist_cloud_top = max(hist_a, hist_b)
-        hist_cloud_bottom = min(hist_a, hist_b)
+        if not any(pd.isna(v) for v in (chikou_value, hist_price, hist_a, hist_b)):
+            hist_top = max(hist_a, hist_b)
+            hist_bottom = min(hist_a, hist_b)
+            if chikou_value > hist_price and chikou_value > hist_top:
+                bull.append("Chikou bullish")
+            elif chikou_value < hist_price and chikou_value < hist_bottom:
+                bear.append("Chikou bearish")
 
-        if (
-            not pd.isna(chikou_value)
-            and not pd.isna(hist_price)
-            and not pd.isna(hist_cloud_top)
-        ):
-            if chikou_value > hist_price and chikou_value > hist_cloud_top:
-                confirmations_bull.append("Chikou bullish")
-            elif chikou_value < hist_price and chikou_value < hist_cloud_bottom:
-                confirmations_bear.append("Chikou bearish")
-
-    bull_count = len(confirmations_bull)
-    bear_count = len(confirmations_bear)
+    bull_count, bear_count = len(bull), len(bear)
 
     if bull_count >= MIN_CONFIRMATIONS and bull_count > bear_count:
-        signal = "BUY"
-        confirmations = confirmations_bull
+        signal, confirmations = "BUY", bull
     elif bear_count >= MIN_CONFIRMATIONS and bear_count > bull_count:
-        signal = "SELL"
-        confirmations = confirmations_bear
+        signal, confirmations = "SELL", bear
     else:
-        signal = "NEUTRAL"
-        confirmations = []
+        signal, confirmations = "NEUTRAL", []
 
     return {
         "signal": signal,
@@ -294,19 +267,24 @@ def analyze_timeframe(df):
 
 
 # =========================
-# MULTI-TIMEFRAME
+# MULTI-TIMEFRAME (fetched concurrently)
 # =========================
 def analyze_symbol(symbol):
     results = {}
 
-    for label, kucoin_interval in TIMEFRAMES.items():
-        df = fetch_klines(symbol, kucoin_interval)
-        results[label] = analyze_timeframe(df)
+    with ThreadPoolExecutor(max_workers=len(TIMEFRAMES)) as pool:
+        futures = {
+            pool.submit(fetch_klines, symbol, interval): label
+            for label, interval in TIMEFRAMES.items()
+        }
+        for future in as_completed(futures):
+            label = futures[future]
+            df = future.result()
+            results[label] = analyze_timeframe(df)
 
-    buy_tfs = [tf for tf, r in results.items() if r["signal"] == "BUY"]
-    sell_tfs = [tf for tf, r in results.items() if r["signal"] == "SELL"]
+    buy_tfs = [tf for tf in TIMEFRAMES if results[tf]["signal"] == "BUY"]
+    sell_tfs = [tf for tf in TIMEFRAMES if results[tf]["signal"] == "SELL"]
 
-    # Final signal requires agreement from at least 2 timeframes.
     if len(buy_tfs) >= MIN_TF_CONFIRMATIONS and len(buy_tfs) > len(sell_tfs):
         final_signal = "BUY"
     elif len(sell_tfs) >= MIN_TF_CONFIRMATIONS and len(sell_tfs) > len(buy_tfs):
@@ -328,7 +306,7 @@ def send_telegram(text):
         "disable_web_page_preview": True,
     }
 
-    r = requests.post(url, json=payload, timeout=15)
+    r = SESSION.post(url, json=payload, timeout=15)
     r.raise_for_status()
 
     result = r.json()
@@ -348,17 +326,11 @@ def fmt_price(price):
 
 def build_message(symbol, final_signal, results, buy_tfs, sell_tfs):
     if final_signal == "BUY":
-        title = "🟢 ICHIMOKU BUY SIGNAL"
-        emoji = "🟢"
-        agreeing = buy_tfs
+        title, agreeing = "🟢 ICHIMOKU BUY SIGNAL", buy_tfs
     elif final_signal == "SELL":
-        title = "🔴 ICHIMOKU SELL SIGNAL"
-        emoji = "🔴"
-        agreeing = sell_tfs
+        title, agreeing = "🔴 ICHIMOKU SELL SIGNAL", sell_tfs
     else:
-        title = "⚪ ICHIMOKU NEUTRAL"
-        emoji = "⚪"
-        agreeing = []
+        title, agreeing = "⚪ ICHIMOKU NEUTRAL", []
 
     lines = [
         title,
@@ -370,8 +342,7 @@ def build_message(symbol, final_signal, results, buy_tfs, sell_tfs):
     ]
 
     for tf in TIMEFRAMES:
-        r = results[tf]
-        s = r["signal"]
+        s = results[tf]["signal"]
         mark = "🟢" if s == "BUY" else "🔴" if s == "SELL" else "⚪"
         lines.append(f"{mark} {tf}: {s}")
 
@@ -382,18 +353,13 @@ def build_message(symbol, final_signal, results, buy_tfs, sell_tfs):
             f"Agreeing TFs: {', '.join(agreeing)}",
         ]
 
-    # Show details for each timeframe, keeping the message compact.
     lines += ["", "Ichimoku confirmations:"]
-
     for tf in TIMEFRAMES:
         r = results[tf]
         if r["signal"] in ("BUY", "SELL"):
-            checks = " + ".join(r["confirmations"])
-            lines.append(f"{tf}: {checks}")
+            lines.append(f"{tf}: {' + '.join(r['confirmations'])}")
 
-    # Use the most recent 15m close as a simple displayed current reference.
     latest_price = results["15m"]["price"]
-
     lines += [
         "",
         f"Reference Price: {fmt_price(latest_price)} USDT",
@@ -415,44 +381,21 @@ def scan_once():
         try:
             final_signal, results, buy_tfs, sell_tfs = analyze_symbol(symbol)
 
-            previous = state.get(symbol, {}).get("final_signal")
-
             log.info(
                 "%s -> %s | BUY TFs=%s | SELL TFs=%s",
-                symbol,
-                final_signal,
-                buy_tfs,
-                sell_tfs,
+                symbol, final_signal, buy_tfs, sell_tfs,
             )
 
-            should_send = False
-
-            if final_signal in ("BUY", "SELL"):
-                # Notify only when a new actionable signal appears or changes.
-                if previous != final_signal:
-                    should_send = True
-            elif SEND_NEUTRAL and previous != "NEUTRAL":
-                should_send = True
-
-            if should_send:
-                message = build_message(
-                    symbol, final_signal, results, buy_tfs, sell_tfs
-                )
-                send_telegram(message)
-                log.info("Telegram sent for %s: %s", symbol, final_signal)
-
-            state[symbol] = {
-                "final_signal": final_signal,
-                "updated_at": datetime.now(timezone.utc).isoformat(),
-                "buy_tfs": buy_tfs,
-                "sell_tfs": sell_tfs,
-            }
-            save_state(state)
+            # Always send — every scan reports every symbol's current signal,
+            # regardless of whether it changed since the last run.
+            message = build_message(symbol, final_signal, results, buy_tfs, sell_tfs)
+            send_telegram(message)
+            log.info("Telegram sent for %s: %s", symbol, final_signal)
 
         except Exception as exc:
             log.exception("Error scanning %s: %s", symbol, exc)
 
-    log.info("Scan completed.")
+    log.info("Scan completed at %s", datetime.now(timezone.utc).isoformat())
 
 
 def main():
@@ -460,9 +403,9 @@ def main():
     log.info("Symbols: %s", ", ".join(SYMBOLS))
     log.info("Timeframes: %s", ", ".join(TIMEFRAMES))
     log.info(
-        "Rules: >=%d Ichimoku confirmations per TF + >=%d agreeing TFs",
-        MIN_CONFIRMATIONS,
-        MIN_TF_CONFIRMATIONS,
+        "Rules: >=%d Ichimoku confirmations per TF + >=%d agreeing TFs. "
+        "Sends a Telegram message every scan (no change-filtering).",
+        MIN_CONFIRMATIONS, MIN_TF_CONFIRMATIONS,
     )
 
     scan_once()
