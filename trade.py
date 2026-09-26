@@ -507,6 +507,11 @@ def scan_once():
             final_signal, results, buy_tfs, sell_tfs = analyze_symbol(symbol)
             log.info("%s -> %s | BUY TFs=%s | SELL TFs=%s", symbol, final_signal, buy_tfs, sell_tfs)
 
+            has_any_signal = any(results[tf]["signal"] in ("BUY", "SELL") for tf in TIMEFRAMES)
+            if not has_any_signal:
+                log.info("%s: all timeframes NEUTRAL, skipping Telegram message.", symbol)
+                continue
+
             btc_gate_blocked = False
             if symbol != BTC_SYMBOL and btc_trend is not None and final_signal != "NEUTRAL":
                 sig_num = 1 if final_signal == "BUY" else -1
@@ -532,7 +537,8 @@ def main():
         "Filters active per timeframe: kumo thickness, breakout margin, ADX>=%d, "
         "EMA%d trend, RSI(%d) %d/%d, Bollinger width>=%.1f%%, volume/OBV confirmation, "
         "market structure. Plus a global BTC-4h-trend correlation gate for altcoins. "
-        "Sends a Telegram message every scan (no change-filtering).",
+        "A symbol is skipped (no Telegram message) when every timeframe is NEUTRAL; "
+        "otherwise it's sent every scan regardless of whether the signal changed.",
         ADX_MIN, EMA_PERIOD, RSI_PERIOD, RSI_OVERSOLD, RSI_OVERBOUGHT, BB_WIDTH_MIN_PCT,
     )
     scan_once()
