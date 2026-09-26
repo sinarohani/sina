@@ -336,11 +336,13 @@ def analyze_timeframe(df):
     bull, bear = compute_confirmations(df, i)
     bull_count, bear_count = len(bull), len(bear)
 
-    signal, confirmations = "NEUTRAL", []
+    raw_signal, signal, confirmations = "NEUTRAL", "NEUTRAL", []
     if bull_count >= MIN_CONFIRMATIONS and bull_count > bear_count:
-        signal, confirmations = "BUY", bull
+        raw_signal = signal = "BUY"
+        confirmations = bull
     elif bear_count >= MIN_CONFIRMATIONS and bear_count > bull_count:
-        signal, confirmations = "SELL", bear
+        raw_signal = signal = "SELL"
+        confirmations = bear
 
     filters_failed = []
     if signal != "NEUTRAL":
@@ -351,6 +353,7 @@ def analyze_timeframe(df):
 
     return {
         "signal": signal,
+        "raw_signal": raw_signal,  # what Ichimoku alone said, before extra filters
         "confirmations": confirmations,
         "filters_failed": filters_failed,
         "bull_count": bull_count,
@@ -429,41 +432,60 @@ def fmt_price(price):
     return f"{price:.8f}"
 
 
+FILTER_LABELS = {
+    "thin_kumo": "thin cloud",
+    "weak_breakout": "weak breakout",
+    "low_adx": "no trend (ADX)",
+    "against_ema200": "against EMA200",
+    "ema_warmup": "EMA warmup",
+    "rsi_extreme": "RSI extreme",
+    "rsi_warmup": "RSI warmup",
+    "low_volatility": "low volatility",
+    "no_volume_confirmation": "no volume confirm",
+    "volume_warmup": "volume warmup",
+    "below_resistance": "below resistance",
+    "above_support": "above support",
+}
+
+
+def tf_line(tf, r):
+    """One compact line per timeframe: mark + label, and if Ichimoku wanted a
+    signal but an extra filter blocked it, show the top reason why."""
+    s = r["signal"]
+    mark = "🟢" if s == "BUY" else "🔴" if s == "SELL" else "⚪"
+
+    if s == "NEUTRAL" and r.get("raw_signal") in ("BUY", "SELL") and r.get("filters_failed"):
+        reasons = ", ".join(FILTER_LABELS.get(f, f) for f in r["filters_failed"][:2])
+        return f"{mark} {tf}: blocked ({reasons})"
+
+    return f"{mark} {tf}: {s}"
+
+
 def build_message(symbol, final_signal, results, buy_tfs, sell_tfs, btc_gate_blocked):
-    if final_signal == "BUY":
-        title, agreeing = "🟢 ICHIMOKU BUY SIGNAL", buy_tfs
-    elif final_signal == "SELL":
-        title, agreeing = "🔴 ICHIMOKU SELL SIGNAL", sell_tfs
-    else:
-        title, agreeing = "⚪ ICHIMOKU NEUTRAL", []
-
-    lines = [title, "━━━━━━━━━━━━━━━━━━", f"Symbol: {symbol}", f"Final: {final_signal}"]
-
-    if btc_gate_blocked:
-        lines.append("⚠️ Blocked by BTC-correlation filter (BTC trend disagrees)")
-
-    lines += ["", "Multi-Timeframe:"]
-    for tf in TIMEFRAMES:
-        s = results[tf]["signal"]
-        mark = "🟢" if s == "BUY" else "🔴" if s == "SELL" else "⚪"
-        lines.append(f"{mark} {tf}: {s}")
-
-    if agreeing:
-        lines += ["", f"TF Confirmation: {len(agreeing)}/{len(TIMEFRAMES)}",
-                  f"Agreeing TFs: {', '.join(agreeing)}"]
-
-    lines += ["", "Ichimoku confirmations:"]
-    for tf in TIMEFRAMES:
-        r = results[tf]
-        if r["signal"] in ("BUY", "SELL"):
-            lines.append(f"{tf}: {' + '.join(r['confirmations'])}")
+    emoji = "🟢" if final_signal == "BUY" else "🔴" if final_signal == "SELL" else "⚪"
+    agreeing = buy_tfs if final_signal == "BUY" else sell_tfs if final_signal == "SELL" else []
 
     latest_price = results["15m"]["price"]
-    lines += [
-        "", f"Reference Price: {fmt_price(latest_price)} USDT",
-        f"Closed candle: {results['15m']['candle_time']}",
-        "", "⚠️ Technical signal only — not financial advice.",
-    ]
+
+    lines = [f"{emoji} {symbol} — {final_signal}", f"{fmt_price(latest_price)} USDT"]
+
+    if agreeing:
+        lines.append(f"{len(agreeing)}/{len(TIMEFRAMES)} timeframes agree: {', '.join(agreeing)}")
+    if btc_gate_blocked:
+        lines.append("⚠️ blocked — BTC 4h trend disagrees")
+
+    lines.append("")
+    for tf in TIMEFRAMES:
+        lines.append(tf_line(tf, results[tf]))
+
+    strong_tfs = [tf for tf in TIMEFRAMES if results[tf]["signal"] in ("BUY", "SELL")]
+    if strong_tfs:
+        lines.append("")
+        for tf in strong_tfs:
+            r = results[tf]
+            lines.append(f"{tf} confirmations: {' + '.join(r['confirmations'])}")
+
+    lines += ["", "⚠️ Technical signal only — not financial advice."]
     return "\n".join(lines)
 
 
