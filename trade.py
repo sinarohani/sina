@@ -310,13 +310,14 @@ def passes_extra_filters(sig, row):
     elif (sig == 1 and row["close"] <= row["ema"]) or (sig == -1 and row["close"] >= row["ema"]):
         failed.append("against_ema200")
 
-    # --- RSI check: runs only after Ichimoku is fully confirmed ---
+    # --- RSI check: runs only after Ichimoku is fully confirmed.
+    # Midline rule: RSI < 50 confirms BUY, RSI > 50 confirms SELL. ---
     if pd.isna(row.get("rsi")):
         failed.append("rsi_warmup")
-    elif sig == 1 and row["rsi"] > RSI_OVERBOUGHT:
-        failed.append("rsi_overbought")
-    elif sig == -1 and row["rsi"] < RSI_OVERSOLD:
-        failed.append("rsi_oversold")
+    elif sig == 1 and row["rsi"] >= 50:
+        failed.append("rsi_not_bullish")
+    elif sig == -1 and row["rsi"] <= 50:
+        failed.append("rsi_not_bearish")
 
     if pd.isna(row.get("bb_width_pct")) or row["bb_width_pct"] < BB_WIDTH_MIN_PCT:
         failed.append("low_volatility")
@@ -452,8 +453,8 @@ FILTER_LABELS = {
     "low_adx": "no trend (ADX)",
     "against_ema200": "against EMA200",
     "ema_warmup": "EMA warmup",
-    "rsi_overbought": "RSI overbought",
-    "rsi_oversold": "RSI oversold",
+    "rsi_not_bullish": "RSI above 50",
+    "rsi_not_bearish": "RSI below 50",
     "rsi_warmup": "RSI warmup",
     "low_volatility": "low volatility",
     "no_volume_confirmation": "no volume confirm",
@@ -551,7 +552,7 @@ def main():
     log.info(
         "Confirmations per timeframe: ALL 4 Ichimoku checks required first. "
         "Only if Ichimoku fully confirms is the signal then checked against: "
-        "RSI overbought/oversold, kumo thickness, breakout margin, ADX>=%d, "
+        "RSI vs 50 midline (BUY needs RSI<50, SELL needs RSI>50), kumo thickness, breakout margin, ADX>=%d, "
         "EMA%d trend, Bollinger width>=%.1f%%, volume/OBV confirmation, "
         "market structure. Plus a global BTC-4h-trend correlation gate for altcoins. "
         "A symbol is skipped (no Telegram message) when every timeframe is NEUTRAL; "
