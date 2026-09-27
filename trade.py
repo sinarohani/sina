@@ -20,10 +20,44 @@ TELEGRAM_URL = "https://api.telegram.org/bot{}/sendMessage"
 SYMBOLS = [
     "BTC-USDT",
     "ETH-USDT",
+    "BNB-USDT",
+    "XRP-USDT",
     "SOL-USDT",
+    "TRX-USDT",
+    "ZEC-USDT",
+    "HYPE-USDT",
     "DOGE-USDT",
-    "POL-USDT",
     "LINK-USDT",
+    "XMR-USDT",
+    "ADA-USDT",
+    "LEO-USDT",
+    "XLM-USDT",
+    "BCH-USDT",
+    "NEAR-USDT",
+    "UNI-USDT",
+    "LTC-USDT",
+    "CC-USDT",
+    "AVAX-USDT",
+    "SUI-USDT",
+    "TON-USDT",
+    "HBAR-USDT",
+    "TAO-USDT",
+    "SHIB-USDT",
+    "CRO-USDT",
+    "M-USDT",
+    "ENA-USDT",
+    "ONDO-USDT",
+    "OKB-USDT",
+    "AAVE-USDT",
+    "MNT-USDT",
+    "DOT-USDT",
+    "PUMP-USDT",
+    "ASTER-USDT",
+    "WLD-USDT",
+    "WLFI-USDT",
+    "SKY-USDT",
+    "PEPE-USDT",
+    "ICP-USDT",
 ]
 
 TIMEFRAMES = {
@@ -535,11 +569,21 @@ def scan_once():
     for symbol in SYMBOLS:
         try:
             final_signal, results, buy_tfs, sell_tfs = analyze_symbol(symbol)
-            log.info("%s -> %s | BUY TFs=%s | SELL TFs=%s", symbol, final_signal, buy_tfs, sell_tfs)
+
+            if final_signal == "NEUTRAL":
+                log.info(
+                    "%s: NEUTRAL overall - only %d BUY tf(s) %s and %d SELL tf(s) %s, need >=%d agreeing one-sided",
+                    symbol, len(buy_tfs), buy_tfs or "-", len(sell_tfs), sell_tfs or "-", MIN_TF_CONFIRMATIONS,
+                )
+            else:
+                log.info("%s: %d/%d timeframes agree on %s (%s)",
+                          symbol, len(buy_tfs if final_signal == "BUY" else sell_tfs),
+                          len(TIMEFRAMES), final_signal,
+                          ", ".join(buy_tfs if final_signal == "BUY" else sell_tfs))
 
             has_any_signal = any(results[tf]["signal"] in ("BUY", "SELL") for tf in TIMEFRAMES)
             if not has_any_signal:
-                log.info("%s: all timeframes NEUTRAL, skipping Telegram message.", symbol)
+                log.info("%s: SKIP Telegram - every timeframe NEUTRAL", symbol)
                 continue
 
             btc_gate_blocked = False
@@ -547,11 +591,13 @@ def scan_once():
                 sig_num = 1 if final_signal == "BUY" else -1
                 if (sig_num == 1 and btc_trend < 0) or (sig_num == -1 and btc_trend > 0):
                     btc_gate_blocked = True
+                    log.info("%s: BLOCKED - %s disagrees with BTC 4h trend (%s)",
+                              symbol, final_signal, btc_trend)
                     final_signal = "NEUTRAL"
 
             message = build_message(symbol, final_signal, results, buy_tfs, sell_tfs, btc_gate_blocked)
             send_telegram(message)
-            log.info("Telegram sent for %s: %s", symbol, final_signal)
+            log.info("%s: Telegram sent - final signal %s", symbol, final_signal)
 
         except Exception as exc:
             log.exception("Error scanning %s: %s", symbol, exc)
