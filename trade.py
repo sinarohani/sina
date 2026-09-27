@@ -24,6 +24,23 @@ SYMBOLS = [
     "DOGE-USDT",
     "POL-USDT",
     "LINK-USDT",
+] + [
+    # Top ~50 by CoinMarketCap rank (as of Sep 2026), minus USD-pegged
+    # stablecoins (USDT/USDC/USDe/DAI/USD1/USDG/RLUSD/PYUSD — a trend/RSI
+    # strategy has nothing to say about an asset held flat at $1) and minus
+    # anything already listed above. Some of the very new listings (CC, M,
+    # ASTER, WLFI, PUMP) may not have a USDT spot pair on KuCoin yet; if so,
+    # fetch_all_klines() just logs a warning for that symbol each scan and
+    # moves on, it won't crash the scanner. Trim this list if those warnings
+    # get noisy.
+    "BNB-USDT", "XRP-USDT", "TRX-USDT", "ZEC-USDT", "HYPE-USDT",
+    "XMR-USDT", "ADA-USDT", "LEO-USDT", "XLM-USDT", "BCH-USDT",
+    "NEAR-USDT", "UNI-USDT", "LTC-USDT", "CC-USDT", "AVAX-USDT",
+    "SUI-USDT", "GRAM-USDT", "HBAR-USDT", "TAO-USDT", "SHIB-USDT",
+    "CRO-USDT", "XAUT-USDT", "M-USDT", "ENA-USDT", "ONDO-USDT",
+    "OKB-USDT", "AAVE-USDT", "MNT-USDT", "DOT-USDT", "PUMP-USDT",
+    "ASTER-USDT", "WLD-USDT", "PAXG-USDT", "WLFI-USDT", "SKY-USDT",
+    "PEPE-USDT", "ICP-USDT",
 ]
 
 TIMEFRAMES = {
@@ -112,8 +129,23 @@ SESSION = build_session()
 # =========================
 # KUCOIN
 # =========================
+INTERVAL_SECONDS = {"15min": 15 * 60, "1hour": 3600, "4hour": 4 * 3600, "1day": 86400}
+
+# Label (e.g. "4h") that TIMEFRAMES maps to the KuCoin interval used for the
+# BTC correlation gate, resolved once so the fetch for that timeframe can be
+# reused instead of hitting the API for BTC twice per scan.
+BTC_TF_LABEL = next(
+    (label for label, interval in TIMEFRAMES.items() if interval == BTC_CORRELATION_TF),
+    None,
+)
+if BTC_TF_LABEL is None:
+    raise SystemExit(
+        f"BTC_CORRELATION_TF={BTC_CORRELATION_TF!r} has no matching entry in TIMEFRAMES"
+    )
+
+
 def interval_to_seconds(interval):
-    return {"15min": 15 * 60, "1hour": 3600, "4hour": 4 * 3600, "1day": 86400}[interval]
+    return INTERVAL_SECONDS[interval]
 
 
 def fetch_klines(symbol, interval):
@@ -152,6 +184,33 @@ def fetch_klines(symbol, interval):
         raise RuntimeError(f"Not enough CLOSED candles for {symbol} {interval}: {len(df)}")
 
     return df.tail(CANDLE_LIMIT).reset_index(drop=True)
+
+
+def fetch_all_klines(symbols, timeframes):
+    """Fetch every (symbol, timeframe) combination through a single shared
+    pool capped at MAX_WORKERS, instead of one pool per symbol. This keeps
+    the same concurrency ceiling but actually uses all of it at once, so a
+    full scan finishes in one wave of requests instead of len(symbols)
+    sequential waves.
+
+    Returns {symbol: {label: df_or_None}}. A None means that fetch failed;
+    the failure is logged here and the caller decides how to handle it.
+    """
+    results = {symbol: {} for symbol in symbols}
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        futures = {
+            pool.submit(fetch_klines, symbol, interval): (symbol, label)
+            for symbol in symbols
+            for label, interval in timeframes.items()
+        }
+        for future in as_completed(futures):
+            symbol, label = futures[future]
+            try:
+                results[symbol][label] = future.result()
+            except Exception as exc:
+                log.warning("Fetch failed for %s %s: %s", symbol, label, exc)
+                results[symbol][label] = None
+    return results
 
 
 # =========================
@@ -348,6 +407,10 @@ def analyze_timeframe(df):
         raw_signal = signal = "SELL"
         confirmations = bear
 
+    # Kept even if a later filter blocks the signal, purely so logging can
+    # still say *what Ichimoku confirmed* before explaining why it got vetoed.
+    raw_confirmations = list(confirmations)
+
     # Only reached once Ichimoku itself has already confirmed a direction.
     filters_failed = []
     if signal != "NEUTRAL":
@@ -360,6 +423,7 @@ def analyze_timeframe(df):
         "signal": signal,
         "raw_signal": raw_signal,  # what Ichimoku alone said, before extra filters
         "confirmations": confirmations,
+        "raw_confirmations": raw_confirmations,
         "filters_failed": filters_failed,
         "bull_count": bull_count,
         "bear_count": bear_count,
@@ -371,9 +435,16 @@ def analyze_timeframe(df):
 # =========================
 # BTC CORRELATION (global gate)
 # =========================
-def get_btc_trend_4h():
-    """Returns 1 (bullish), -1 (bearish), or 0 (neutral) for BTC's 4h Ichimoku trend."""
-    df = fetch_klines(BTC_SYMBOL, BTC_CORRELATION_TF)
+def get_btc_trend_4h(df=None):
+    """Returns 1 (bullish), -1 (bearish), or 0 (neutral) for BTC's 4h Ichimoku trend.
+
+    Pass in an already-fetched BTC 4h dataframe (scan_once does this, reusing
+    the same fetch used for BTC's own analysis) to avoid hitting the API for
+    BTC a second time every scan. Falls back to fetching it itself if no
+    dataframe is given, so this still works standalone.
+    """
+    if df is None:
+        df = fetch_klines(BTC_SYMBOL, BTC_CORRELATION_TF)
     df = add_ichimoku(df)
     i = len(df) - 1
     row = df.iloc[i]
@@ -389,17 +460,15 @@ def get_btc_trend_4h():
 # =========================
 # MULTI-TIMEFRAME
 # =========================
-def analyze_symbol(symbol):
-    results = {}
-    with ThreadPoolExecutor(max_workers=len(TIMEFRAMES)) as pool:
-        futures = {
-            pool.submit(fetch_klines, symbol, interval): label
-            for label, interval in TIMEFRAMES.items()
-        }
-        for future in as_completed(futures):
-            label = futures[future]
-            df = future.result()
-            results[label] = analyze_timeframe(df)
+def analyze_symbol(symbol, symbol_klines):
+    """symbol_klines: {label: df} for this symbol, already fetched by
+    fetch_all_klines() so every symbol's timeframes are analyzed from data
+    that was pulled in the same concurrent wave rather than fetched here."""
+    missing = [tf for tf in TIMEFRAMES if symbol_klines.get(tf) is None]
+    if missing:
+        raise RuntimeError(f"Missing kline data for {symbol}: {missing}")
+
+    results = {label: analyze_timeframe(symbol_klines[label]) for label in TIMEFRAMES}
 
     buy_tfs = [tf for tf in TIMEFRAMES if results[tf]["signal"] == "BUY"]
     sell_tfs = [tf for tf in TIMEFRAMES if results[tf]["signal"] == "SELL"]
@@ -497,31 +566,78 @@ def build_message(symbol, final_signal, results, buy_tfs, sell_tfs, btc_gate_blo
 # =========================
 # SCANNER
 # =========================
+BTC_TREND_LABEL = {1: "bullish", -1: "bearish", 0: "neutral"}
+
+
+def log_timeframe_reasoning(symbol, tf, r):
+    """DEBUG-level breakdown of exactly why a timeframe ended up BUY/SELL/NEUTRAL."""
+    if r["signal"] in ("BUY", "SELL"):
+        log.debug(
+            "%s %s: %s confirmed — Ichimoku %d/%d (%s), all extra filters passed",
+            symbol, tf, r["signal"], max(r["bull_count"], r["bear_count"]),
+            MIN_CONFIRMATIONS, " + ".join(r["raw_confirmations"]),
+        )
+    elif r.get("raw_signal") in ("BUY", "SELL"):
+        log.debug(
+            "%s %s: Ichimoku confirmed %s (%s) but blocked by filter(s): %s",
+            symbol, tf, r["raw_signal"], " + ".join(r["raw_confirmations"]),
+            ", ".join(FILTER_LABELS.get(f, f) for f in r["filters_failed"]),
+        )
+    else:
+        log.debug(
+            "%s %s: NEUTRAL — Ichimoku bull=%d bear=%d (needs >=%d one-sided)",
+            symbol, tf, r["bull_count"], r["bear_count"], MIN_CONFIRMATIONS,
+        )
+
+
 def scan_once():
     log.info("Starting scan...")
+    t0 = time.time()
 
+    klines = fetch_all_klines(SYMBOLS, TIMEFRAMES)
+    log.debug("Fetched all symbol/timeframe klines in %.2fs", time.time() - t0)
+
+    btc_df = klines.get(BTC_SYMBOL, {}).get(BTC_TF_LABEL)
     try:
-        btc_trend = get_btc_trend_4h()
-        log.info("BTC 4h trend gate: %s", btc_trend)
+        btc_trend = get_btc_trend_4h(btc_df)
+        log.info("BTC 4h trend gate: %s (%+d)", BTC_TREND_LABEL[btc_trend], btc_trend)
     except Exception as exc:
-        log.warning("Could not fetch BTC trend for correlation filter (%s); gate disabled this scan.", exc)
+        log.warning("Could not determine BTC trend for correlation filter (%s); gate disabled this scan.", exc)
         btc_trend = None
 
     for symbol in SYMBOLS:
         try:
-            final_signal, results, buy_tfs, sell_tfs = analyze_symbol(symbol)
-            log.info("%s -> %s | BUY TFs=%s | SELL TFs=%s", symbol, final_signal, buy_tfs, sell_tfs)
+            final_signal, results, buy_tfs, sell_tfs = analyze_symbol(symbol, klines.get(symbol, {}))
+
+            for tf in TIMEFRAMES:
+                log_timeframe_reasoning(symbol, tf, results[tf])
 
             has_any_signal = any(results[tf]["signal"] in ("BUY", "SELL") for tf in TIMEFRAMES)
             if not has_any_signal:
                 log.info("%s: all timeframes NEUTRAL, skipping Telegram message.", symbol)
                 continue
 
+            if final_signal == "NEUTRAL":
+                log.info(
+                    "%s: BUY tfs=%s SELL tfs=%s — no one-sided majority (needs >=%d), final=NEUTRAL but still reporting since a signal exists",
+                    symbol, buy_tfs, sell_tfs, MIN_TF_CONFIRMATIONS,
+                )
+            else:
+                log.info(
+                    "%s: %s confirmed — %d/%d timeframes agree (%s)",
+                    symbol, final_signal, len(buy_tfs if final_signal == "BUY" else sell_tfs),
+                    len(TIMEFRAMES), ", ".join(buy_tfs if final_signal == "BUY" else sell_tfs),
+                )
+
             btc_gate_blocked = False
             if symbol != BTC_SYMBOL and btc_trend is not None and final_signal != "NEUTRAL":
                 sig_num = 1 if final_signal == "BUY" else -1
                 if (sig_num == 1 and btc_trend < 0) or (sig_num == -1 and btc_trend > 0):
                     btc_gate_blocked = True
+                    log.info(
+                        "%s: %s blocked by BTC correlation gate (BTC 4h trend is %s) -> final=NEUTRAL",
+                        symbol, final_signal, BTC_TREND_LABEL[btc_trend],
+                    )
                     final_signal = "NEUTRAL"
 
             message = build_message(symbol, final_signal, results, buy_tfs, sell_tfs, btc_gate_blocked)
@@ -531,7 +647,7 @@ def scan_once():
         except Exception as exc:
             log.exception("Error scanning %s: %s", symbol, exc)
 
-    log.info("Scan completed at %s", datetime.now(timezone.utc).isoformat())
+    log.info("Scan completed in %.2fs at %s", time.time() - t0, datetime.now(timezone.utc).isoformat())
 
 
 def main():
