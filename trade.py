@@ -34,13 +34,14 @@ SYMBOLS = [
     # moves on, it won't crash the scanner. Trim this list if those warnings
     # get noisy.
     "BNB-USDT", "XRP-USDT", "TRX-USDT", "ZEC-USDT", "HYPE-USDT",
-    "XMR-USDT", "ADA-USDT", "LEO-USDT", "XLM-USDT", "BCH-USDT",
+    "XMR-USDT", "ADA-USDT", "XLM-USDT", "BCH-USDT",
     "NEAR-USDT", "UNI-USDT", "LTC-USDT", "CC-USDT", "AVAX-USDT",
     "SUI-USDT", "GRAM-USDT", "HBAR-USDT", "TAO-USDT", "SHIB-USDT",
-    "CRO-USDT", "XAUT-USDT", "M-USDT", "ENA-USDT", "ONDO-USDT",
-    "OKB-USDT", "AAVE-USDT", "MNT-USDT", "DOT-USDT", "PUMP-USDT",
+    "CRO-USDT", "XAUT-USDT", "ENA-USDT", "ONDO-USDT",
+    "AAVE-USDT", "MNT-USDT", "DOT-USDT", "PUMP-USDT",
     "ASTER-USDT", "WLD-USDT", "PAXG-USDT", "WLFI-USDT", "SKY-USDT",
     "PEPE-USDT", "ICP-USDT",
+    # Removed (no USDT spot pair on KuCoin as of Sep 2026): LEO, M, OKB
 ]
 
 TIMEFRAMES = {
