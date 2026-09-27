@@ -88,7 +88,7 @@ CANDLE_LIMIT = 300
 CANDLE_FETCH_BUFFER = 60  # extra candles requested beyond CANDLE_LIMIT
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-MAX_WORKERS = 6
+MAX_WORKERS = 14
 
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
