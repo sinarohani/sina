@@ -245,6 +245,13 @@ def build_indicators(df):
 # SIGNAL LOGIC (per timeframe)
 # =========================
 def compute_confirmations(df, i):
+    """
+    Pure Ichimoku confirmations only (4 checks). This runs FIRST and decides
+    whether there is a candidate BUY/SELL at all. RSI is deliberately NOT
+    part of this step - it is only checked afterwards, in
+    passes_extra_filters(), and only for a symbol/timeframe that already has
+    a full Ichimoku confirmation.
+    """
     close_s, span_a_s, span_b_s = df["close"], df["span_a"], df["span_b"]
     row = df.iloc[i]
     bull, bear = [], []
@@ -276,15 +283,15 @@ def compute_confirmations(df, i):
             elif chikou < hist_price and chikou < bottom:
                 bear.append("Chikou bearish")
 
-    # RSI is intentionally NOT a BUY/SELL vote.
-    # A signal must first have complete Ichimoku confirmation.
-    # RSI remains calculated for monitoring/future optional filtering only.
-
     return bull, bear
 
 
 def passes_extra_filters(sig, row):
-    """All the non-Ichimoku filters. Returns (passed, list_of_failed_filter_names)."""
+    """
+    All the non-Ichimoku filters. Only called once Ichimoku has already
+    fully confirmed a BUY (sig=1) or SELL (sig=-1) candidate.
+    Returns (passed, list_of_failed_filter_names).
+    """
     failed = []
 
     if row["kumo_thickness_pct"] < KUMO_THICKNESS_MIN_PCT:
@@ -302,6 +309,14 @@ def passes_extra_filters(sig, row):
         failed.append("ema_warmup")
     elif (sig == 1 and row["close"] <= row["ema"]) or (sig == -1 and row["close"] >= row["ema"]):
         failed.append("against_ema200")
+
+    # --- RSI check: runs only after Ichimoku is fully confirmed ---
+    if pd.isna(row.get("rsi")):
+        failed.append("rsi_warmup")
+    elif sig == 1 and row["rsi"] > RSI_OVERBOUGHT:
+        failed.append("rsi_overbought")
+    elif sig == -1 and row["rsi"] < RSI_OVERSOLD:
+        failed.append("rsi_oversold")
 
     if pd.isna(row.get("bb_width_pct")) or row["bb_width_pct"] < BB_WIDTH_MIN_PCT:
         failed.append("low_volatility")
@@ -437,6 +452,9 @@ FILTER_LABELS = {
     "low_adx": "no trend (ADX)",
     "against_ema200": "against EMA200",
     "ema_warmup": "EMA warmup",
+    "rsi_overbought": "RSI overbought",
+    "rsi_oversold": "RSI oversold",
+    "rsi_warmup": "RSI warmup",
     "low_volatility": "low volatility",
     "no_volume_confirmation": "no volume confirm",
     "volume_warmup": "volume warmup",
@@ -531,8 +549,9 @@ def main():
     log.info("Symbols: %s", ", ".join(SYMBOLS))
     log.info("Timeframes: %s", ", ".join(TIMEFRAMES))
     log.info(
-        "Confirmations per timeframe: ALL 4 Ichimoku checks required (RSI is not a signal vote). "
-        "Filters per timeframe: kumo thickness, breakout margin, ADX>=%d, "
+        "Confirmations per timeframe: ALL 4 Ichimoku checks required first. "
+        "Only if Ichimoku fully confirms is the signal then checked against: "
+        "RSI overbought/oversold, kumo thickness, breakout margin, ADX>=%d, "
         "EMA%d trend, Bollinger width>=%.1f%%, volume/OBV confirmation, "
         "market structure. Plus a global BTC-4h-trend correlation gate for altcoins. "
         "A symbol is skipped (no Telegram message) when every timeframe is NEUTRAL; "
