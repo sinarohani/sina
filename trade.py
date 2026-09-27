@@ -70,7 +70,7 @@ TIMEFRAMES = {
 # --- Ichimoku ---
 TENKAN, KIJUN, SENKOU_B, DISPLACEMENT = 9, 26, 52, 26
 MIN_CONFIRMATIONS = 4  # Require all 4 Ichimoku confirmations
-MIN_TF_CONFIRMATIONS = 2
+MIN_TF_CONFIRMATIONS = 1
 
 # --- Extra filters (all applied per-timeframe unless noted) ---
 KUMO_THICKNESS_MIN_PCT = 0.30
