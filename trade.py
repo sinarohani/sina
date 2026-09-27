@@ -276,6 +276,12 @@ def compute_confirmations(df, i):
             elif chikou < hist_price and chikou < bottom:
                 bear.append("Chikou bearish")
 
+    if not pd.isna(row.get("rsi")):
+        if row["rsi"] < RSI_OVERSOLD:
+            bull.append(f"RSI oversold (<{RSI_OVERSOLD})")
+        elif row["rsi"] > RSI_OVERBOUGHT:
+            bear.append(f"RSI overbought (>{RSI_OVERBOUGHT})")
+
     return bull, bear
 
 
@@ -298,11 +304,6 @@ def passes_extra_filters(sig, row):
         failed.append("ema_warmup")
     elif (sig == 1 and row["close"] <= row["ema"]) or (sig == -1 and row["close"] >= row["ema"]):
         failed.append("against_ema200")
-
-    if pd.isna(row.get("rsi")):
-        failed.append("rsi_warmup")
-    elif (sig == 1 and row["rsi"] >= RSI_OVERBOUGHT) or (sig == -1 and row["rsi"] <= RSI_OVERSOLD):
-        failed.append("rsi_extreme")
 
     if pd.isna(row.get("bb_width_pct")) or row["bb_width_pct"] < BB_WIDTH_MIN_PCT:
         failed.append("low_volatility")
@@ -438,8 +439,6 @@ FILTER_LABELS = {
     "low_adx": "no trend (ADX)",
     "against_ema200": "against EMA200",
     "ema_warmup": "EMA warmup",
-    "rsi_extreme": "RSI extreme",
-    "rsi_warmup": "RSI warmup",
     "low_volatility": "low volatility",
     "no_volume_confirmation": "no volume confirm",
     "volume_warmup": "volume warmup",
@@ -534,12 +533,13 @@ def main():
     log.info("Symbols: %s", ", ".join(SYMBOLS))
     log.info("Timeframes: %s", ", ".join(TIMEFRAMES))
     log.info(
-        "Filters active per timeframe: kumo thickness, breakout margin, ADX>=%d, "
-        "EMA%d trend, RSI(%d) %d/%d, Bollinger width>=%.1f%%, volume/OBV confirmation, "
+        "Confirmations per timeframe: 4 Ichimoku checks + RSI(%d) vote (<%d=bull, >%d=bear). "
+        "Filters per timeframe: kumo thickness, breakout margin, ADX>=%d, "
+        "EMA%d trend, Bollinger width>=%.1f%%, volume/OBV confirmation, "
         "market structure. Plus a global BTC-4h-trend correlation gate for altcoins. "
         "A symbol is skipped (no Telegram message) when every timeframe is NEUTRAL; "
         "otherwise it's sent every scan regardless of whether the signal changed.",
-        ADX_MIN, EMA_PERIOD, RSI_PERIOD, RSI_OVERSOLD, RSI_OVERBOUGHT, BB_WIDTH_MIN_PCT,
+        RSI_PERIOD, RSI_OVERSOLD, RSI_OVERBOUGHT, ADX_MIN, EMA_PERIOD, BB_WIDTH_MIN_PCT,
     )
     scan_once()
 
