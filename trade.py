@@ -146,7 +146,7 @@ SESSION = build_session()
 # KUCOIN
 # =========================
 def interval_to_seconds(interval):
-    return {"15min": 15 * 60, "1hour": 3600, "4hour": 4 * 3600, "1day": 86400}[interval]
+    return {"15m": 15 * 60, "1h": 3600, "4h": 4 * 3600, "1d": 86400}[interval]
 
 
 def fetch_klines(symbol, interval):
