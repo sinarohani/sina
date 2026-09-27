@@ -27,12 +27,10 @@ SYMBOLS = [
 ] + [
     # Top ~50 by CoinMarketCap rank (as of Sep 2026), minus USD-pegged
     # stablecoins (USDT/USDC/USDe/DAI/USD1/USDG/RLUSD/PYUSD — a trend/RSI
-    # strategy has nothing to say about an asset held flat at $1) and minus
-    # anything already listed above. Some of the very new listings (CC, M,
-    # ASTER, WLFI, PUMP) may not have a USDT spot pair on KuCoin yet; if so,
-    # fetch_all_klines() just logs a warning for that symbol each scan and
-    # moves on, it won't crash the scanner. Trim this list if those warnings
-    # get noisy.
+    # strategy has nothing to say about an asset held flat at $1), minus
+    # anything already listed above, and minus LEO/M/OKB which have no
+    # USDT spot pair on KuCoin (confirmed by testing — they just error out
+    # with "Unsupported trading pair" every scan).
     "BNB-USDT", "XRP-USDT", "TRX-USDT", "ZEC-USDT", "HYPE-USDT",
     "XMR-USDT", "ADA-USDT", "XLM-USDT", "BCH-USDT",
     "NEAR-USDT", "UNI-USDT", "LTC-USDT", "CC-USDT", "AVAX-USDT",
@@ -41,7 +39,6 @@ SYMBOLS = [
     "AAVE-USDT", "MNT-USDT", "DOT-USDT", "PUMP-USDT",
     "ASTER-USDT", "WLD-USDT", "PAXG-USDT", "WLFI-USDT", "SKY-USDT",
     "PEPE-USDT", "ICP-USDT",
-    # Removed (no USDT spot pair on KuCoin as of Sep 2026): LEO, M, OKB
 ]
 
 TIMEFRAMES = {
@@ -133,8 +130,8 @@ SESSION = build_session()
 INTERVAL_SECONDS = {"15min": 15 * 60, "1hour": 3600, "4hour": 4 * 3600, "1day": 86400}
 
 # Label (e.g. "4h") that TIMEFRAMES maps to the KuCoin interval used for the
-# BTC correlation gate, resolved once so the fetch for that timeframe can be
-# reused instead of hitting the API for BTC twice per scan.
+# BTC correlation gate, resolved once so that fetch can be reused instead of
+# hitting the API for BTC a second time every scan.
 BTC_TF_LABEL = next(
     (label for label, interval in TIMEFRAMES.items() if interval == BTC_CORRELATION_TF),
     None,
@@ -189,14 +186,9 @@ def fetch_klines(symbol, interval):
 
 def fetch_all_klines(symbols, timeframes):
     """Fetch every (symbol, timeframe) combination through a single shared
-    pool capped at MAX_WORKERS, instead of one pool per symbol. This keeps
-    the same concurrency ceiling but actually uses all of it at once, so a
-    full scan finishes in one wave of requests instead of len(symbols)
-    sequential waves.
-
-    Returns {symbol: {label: df_or_None}}. A None means that fetch failed;
-    the failure is logged here and the caller decides how to handle it.
-    """
+    pool capped at MAX_WORKERS, instead of one pool per symbol processed
+    sequentially. Returns {symbol: {label: df_or_None}}; a None means that
+    fetch failed (logged here), and the caller decides how to handle it."""
     results = {symbol: {} for symbol in symbols}
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
         futures = {
@@ -441,8 +433,7 @@ def get_btc_trend_4h(df=None):
 
     Pass in an already-fetched BTC 4h dataframe (scan_once does this, reusing
     the same fetch used for BTC's own analysis) to avoid hitting the API for
-    BTC a second time every scan. Falls back to fetching it itself if no
-    dataframe is given, so this still works standalone.
+    BTC a second time every scan. Falls back to fetching it itself otherwise.
     """
     if df is None:
         df = fetch_klines(BTC_SYMBOL, BTC_CORRELATION_TF)
@@ -463,8 +454,7 @@ def get_btc_trend_4h(df=None):
 # =========================
 def analyze_symbol(symbol, symbol_klines):
     """symbol_klines: {label: df} for this symbol, already fetched by
-    fetch_all_klines() so every symbol's timeframes are analyzed from data
-    that was pulled in the same concurrent wave rather than fetched here."""
+    fetch_all_klines() in one shared concurrent wave for all symbols."""
     missing = [tf for tf in TIMEFRAMES if symbol_klines.get(tf) is None]
     if missing:
         raise RuntimeError(f"Missing kline data for {symbol}: {missing}")
@@ -620,7 +610,8 @@ def scan_once():
 
             if final_signal == "NEUTRAL":
                 log.info(
-                    "%s: BUY tfs=%s SELL tfs=%s — no one-sided majority (needs >=%d), final=NEUTRAL but still reporting since a signal exists",
+                    "%s: BUY tfs=%s SELL tfs=%s — no one-sided majority (needs >=%d), "
+                    "final=NEUTRAL but still reporting since a signal exists",
                     symbol, buy_tfs, sell_tfs, MIN_TF_CONFIRMATIONS,
                 )
             else:
