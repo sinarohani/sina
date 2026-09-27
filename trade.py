@@ -1,5 +1,4 @@
 import os
-import time
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
@@ -143,7 +142,7 @@ SESSION = build_session()
 
 
 # =========================
-# KUCOIN
+# BINANCE
 # =========================
 def interval_to_seconds(interval):
     return {"15m": 15 * 60, "1h": 3600, "4h": 4 * 3600, "1d": 86400}[interval]
@@ -151,31 +150,32 @@ def interval_to_seconds(interval):
 
 def fetch_klines(symbol, interval):
     seconds = interval_to_seconds(interval)
-    now = int(time.time())
-    start_at = now - (CANDLE_LIMIT + CANDLE_FETCH_BUFFER) * seconds
-
     params = {
-        "symbol": symbol, "tradeType": "SPOT", "klineType": "TRADE",
-        "interval": interval, "startAt": start_at, "endAt": now,
+        "symbol": symbol,
+        "interval": interval,
+        "limit": CANDLE_LIMIT + CANDLE_FETCH_BUFFER,
     }
     r = SESSION.get(BINANCE_URL, params=params, timeout=15)
     r.raise_for_status()
     payload = r.json()
 
-    if payload.get("code") != "200000":
-        raise RuntimeError(f"KuCoin error: {payload}")
+    if isinstance(payload, dict):
+        # Binance returns an error object instead of a list on failure,
+        # e.g. {"code": -1121, "msg": "Invalid symbol."}
+        raise RuntimeError(f"Binance error: {payload}")
 
-    rows = payload.get("data", {}).get("list", [])
+    rows = payload
     if not rows:
         raise RuntimeError(f"No kline data for {symbol} {interval}")
 
-    rows.sort(key=lambda x: int(x[0]))
-    df = pd.DataFrame(
-        rows, columns=["timestamp", "open", "close", "high", "low", "volume", "turnover"]
-    )
-    for col in ["open", "close", "high", "low", "volume"]:
+    df = pd.DataFrame(rows, columns=[
+        "open_time", "open", "high", "low", "close", "volume", "close_time",
+        "quote_volume", "trades", "taker_buy_base", "taker_buy_quote", "ignore",
+    ])
+    for col in ["open", "high", "low", "close", "volume"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
-    df["timestamp"] = pd.to_datetime(pd.to_numeric(df["timestamp"]), unit="s", utc=True)
+    df["timestamp"] = pd.to_datetime(pd.to_numeric(df["open_time"]), unit="ms", utc=True)
+    df = df[["timestamp", "open", "high", "low", "close", "volume"]]
     df = df.dropna().drop_duplicates(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
 
     now_ts = pd.Timestamp.now(tz="UTC")
