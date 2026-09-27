@@ -1,663 +1,555 @@
-import os
-import time
-import logging
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+‏import os
+‏import time
+‏import logging
+‏from concurrent.futures import ThreadPoolExecutor, as_completed
+‏from datetime import datetime, timezone
 
-import requests
-from requests.adapters import HTTPAdapter, Retry
-import pandas as pd
-from dotenv import load_dotenv
+‏import requests
+‏from requests.adapters import HTTPAdapter, Retry
+‏import pandas as pd
+‏from dotenv import load_dotenv
 
-load_dotenv()
+‏load_dotenv()
 
 # =========================
-# CONFIG
+‏# CONFIG
 # =========================
-KUCOIN_URL = "https://api.kucoin.com/api/ua/v2/market/kline"
-TELEGRAM_URL = "https://api.telegram.org/bot{}/sendMessage"
+‏KUCOIN_URL = "https://api.kucoin.com/api/ua/v2/market/kline"
+‏TELEGRAM_URL = "https://api.telegram.org/bot{}/sendMessage"
 
-SYMBOLS = [
-    "BTC-USDT",
-    "ETH-USDT",
-    "SOL-USDT",
-    "DOGE-USDT",
-    "POL-USDT",
-    "LINK-USDT",
-] + [
-    # Top ~50 by CoinMarketCap rank (as of Sep 2026), minus USD-pegged
-    # stablecoins (USDT/USDC/USDe/DAI/USD1/USDG/RLUSD/PYUSD — a trend/RSI
-    # strategy has nothing to say about an asset held flat at $1), minus
-    # anything already listed above, and minus LEO/M/OKB which have no
-    # USDT spot pair on KuCoin (confirmed by testing — they just error out
-    # with "Unsupported trading pair" every scan).
-    "BNB-USDT", "XRP-USDT", "TRX-USDT", "ZEC-USDT", "HYPE-USDT",
-    "XMR-USDT", "ADA-USDT", "XLM-USDT", "BCH-USDT",
-    "NEAR-USDT", "UNI-USDT", "LTC-USDT", "CC-USDT", "AVAX-USDT",
-    "SUI-USDT", "GRAM-USDT", "HBAR-USDT", "TAO-USDT", "SHIB-USDT",
-    "CRO-USDT", "XAUT-USDT", "ENA-USDT", "ONDO-USDT",
-    "AAVE-USDT", "MNT-USDT", "DOT-USDT", "PUMP-USDT",
-    "ASTER-USDT", "WLD-USDT", "PAXG-USDT", "WLFI-USDT", "SKY-USDT",
-    "PEPE-USDT", "ICP-USDT",
+‏SYMBOLS = [
+‏    "BTC-USDT",
+‏    "ETH-USDT",
+‏    "SOL-USDT",
+‏    "DOGE-USDT",
+‏    "POL-USDT",
+‏    "LINK-USDT",
 ]
 
-TIMEFRAMES = {
-    "15m": "15min",
-    "1h": "1hour",
-    "4h": "4hour",
-    "1D": "1day",
+‏TIMEFRAMES = {
+‏    "15m": "15min",
+‏    "1h": "1hour",
+‏    "4h": "4hour",
+‏    "1D": "1day",
 }
 
-# --- Ichimoku ---
-TENKAN, KIJUN, SENKOU_B, DISPLACEMENT = 9, 26, 52, 26
-MIN_CONFIRMATIONS = 4  # Require all 4 Ichimoku confirmations
-MIN_TF_CONFIRMATIONS = 2
+‏# --- Ichimoku ---
+‏TENKAN, KIJUN, SENKOU_B, DISPLACEMENT = 9, 26, 52, 26
+‏MIN_CONFIRMATIONS = 4  # Require all 4 Ichimoku confirmations
+‏MIN_TF_CONFIRMATIONS = 2
 
-# --- Extra filters (all applied per-timeframe unless noted) ---
-KUMO_THICKNESS_MIN_PCT = 0.30
-BREAKOUT_MARGIN_PCT = 0.15
+‏# --- Extra filters (all applied per-timeframe unless noted) ---
+‏KUMO_THICKNESS_MIN_PCT = 0.30
+‏BREAKOUT_MARGIN_PCT = 0.15
 
-ADX_PERIOD = 14
-ADX_MIN = 20
+‏ADX_PERIOD = 14
+‏ADX_MIN = 20
 
-EMA_PERIOD = 200
+‏EMA_PERIOD = 200
 
-RSI_PERIOD = 14
-RSI_MIDLINE = 50  # RSI confirms BUY when below this, SELL when above it
+‏RSI_PERIOD = 14
+‏RSI_MIDLINE = 50  # RSI confirms BUY when below this, SELL when above it
 
-BB_PERIOD = 20
-BB_STD = 2
-BB_WIDTH_MIN_PCT = 1.0
+‏BB_PERIOD = 20
+‏BB_STD = 2
+‏BB_WIDTH_MIN_PCT = 1.0
 
-VOLUME_MA_PERIOD = 20
-VOLUME_SPIKE_MULT = 1.2
+‏VOLUME_MA_PERIOD = 20
+‏VOLUME_SPIKE_MULT = 1.2
 
-SWING_WINDOW = 5
-STRUCTURE_MARGIN_PCT = 0.25
+‏SWING_WINDOW = 5
+‏STRUCTURE_MARGIN_PCT = 0.25
 
-# BTC correlation is a global gate applied to the final combined signal,
-# using BTC's own 4h Ichimoku trend. Skipped for BTC itself.
-BTC_SYMBOL = "BTC-USDT"
-BTC_CORRELATION_TF = "4hour"
+‏# BTC correlation is a global gate applied to the final combined signal,
+‏# using BTC's own 4h Ichimoku trend. Skipped for BTC itself.
+‏BTC_SYMBOL = "BTC-USDT"
+‏BTC_CORRELATION_TF = "4hour"
 
-# Need enough closed candles for EMA200 warmup + Ichimoku displacement on
-# every timeframe, including 1-day (200 daily candles = ~200 days back).
-CANDLE_LIMIT = 300
-CANDLE_FETCH_BUFFER = 60  # extra candles requested beyond CANDLE_LIMIT
+‏# Need enough closed candles for EMA200 warmup + Ichimoku displacement on
+‏# every timeframe, including 1-day (200 daily candles = ~200 days back).
+‏CANDLE_LIMIT = 300
+‏CANDLE_FETCH_BUFFER = 60  # extra candles requested beyond CANDLE_LIMIT
 
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-MAX_WORKERS = 14
+‏LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+‏MAX_WORKERS = 6
 
-logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL, logging.INFO),
-    format="%(asctime)s | %(levelname)s | %(message)s",
+‏logging.basicConfig(
+‏    level=getattr(logging, LOG_LEVEL, logging.INFO),
+‏    format="%(asctime)s | %(levelname)s | %(message)s",
 )
-log = logging.getLogger("ichimoku-bot")
+‏log = logging.getLogger("ichimoku-bot")
 
 
 # =========================
-# ENV
+‏# ENV
 # =========================
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+‏TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+‏TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-    raise SystemExit("TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set in .env")
+‏if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+‏    raise SystemExit("TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set in .env")
 
 
 # =========================
-# HTTP SESSION
+‏# HTTP SESSION
 # =========================
-def build_session():
-    session = requests.Session()
-    retries = Retry(
-        total=3, backoff_factor=0.5,
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["GET", "POST"],
+‏def build_session():
+‏    session = requests.Session()
+‏    retries = Retry(
+‏        total=3, backoff_factor=0.5,
+‏        status_forcelist=[429, 500, 502, 503, 504],
+‏        allowed_methods=["GET", "POST"],
     )
-    adapter = HTTPAdapter(max_retries=retries, pool_maxsize=MAX_WORKERS + 2)
-    session.mount("https://", adapter)
-    session.mount("http://", adapter)
-    return session
+‏    adapter = HTTPAdapter(max_retries=retries, pool_maxsize=MAX_WORKERS + 2)
+‏    session.mount("https://", adapter)
+‏    session.mount("http://", adapter)
+‏    return session
 
 
-SESSION = build_session()
+‏SESSION = build_session()
 
 
 # =========================
-# KUCOIN
+‏# KUCOIN
 # =========================
-INTERVAL_SECONDS = {"15min": 15 * 60, "1hour": 3600, "4hour": 4 * 3600, "1day": 86400}
-
-# Label (e.g. "4h") that TIMEFRAMES maps to the KuCoin interval used for the
-# BTC correlation gate, resolved once so that fetch can be reused instead of
-# hitting the API for BTC a second time every scan.
-BTC_TF_LABEL = next(
-    (label for label, interval in TIMEFRAMES.items() if interval == BTC_CORRELATION_TF),
-    None,
-)
-if BTC_TF_LABEL is None:
-    raise SystemExit(
-        f"BTC_CORRELATION_TF={BTC_CORRELATION_TF!r} has no matching entry in TIMEFRAMES"
-    )
+‏def interval_to_seconds(interval):
+‏    return {"15min": 15 * 60, "1hour": 3600, "4hour": 4 * 3600, "1day": 86400}[interval]
 
 
-def interval_to_seconds(interval):
-    return INTERVAL_SECONDS[interval]
+‏def fetch_klines(symbol, interval):
+‏    seconds = interval_to_seconds(interval)
+‏    now = int(time.time())
+‏    start_at = now - (CANDLE_LIMIT + CANDLE_FETCH_BUFFER) * seconds
 
-
-def fetch_klines(symbol, interval):
-    seconds = interval_to_seconds(interval)
-    now = int(time.time())
-    start_at = now - (CANDLE_LIMIT + CANDLE_FETCH_BUFFER) * seconds
-
-    params = {
-        "symbol": symbol, "tradeType": "SPOT", "klineType": "TRADE",
-        "interval": interval, "startAt": start_at, "endAt": now,
+‏    params = {
+‏        "symbol": symbol, "tradeType": "SPOT", "klineType": "TRADE",
+‏        "interval": interval, "startAt": start_at, "endAt": now,
     }
-    r = SESSION.get(KUCOIN_URL, params=params, timeout=15)
-    r.raise_for_status()
-    payload = r.json()
+‏    r = SESSION.get(KUCOIN_URL, params=params, timeout=15)
+‏    r.raise_for_status()
+‏    payload = r.json()
 
-    if payload.get("code") != "200000":
-        raise RuntimeError(f"KuCoin error: {payload}")
+‏    if payload.get("code") != "200000":
+‏        raise RuntimeError(f"KuCoin error: {payload}")
 
-    rows = payload.get("data", {}).get("list", [])
-    if not rows:
-        raise RuntimeError(f"No kline data for {symbol} {interval}")
+‏    rows = payload.get("data", {}).get("list", [])
+‏    if not rows:
+‏        raise RuntimeError(f"No kline data for {symbol} {interval}")
 
-    rows.sort(key=lambda x: int(x[0]))
-    df = pd.DataFrame(
-        rows, columns=["timestamp", "open", "close", "high", "low", "volume", "turnover"]
+‏    rows.sort(key=lambda x: int(x[0]))
+‏    df = pd.DataFrame(
+‏        rows, columns=["timestamp", "open", "close", "high", "low", "volume", "turnover"]
     )
-    for col in ["open", "close", "high", "low", "volume"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-    df["timestamp"] = pd.to_datetime(pd.to_numeric(df["timestamp"]), unit="s", utc=True)
-    df = df.dropna().drop_duplicates(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+‏    for col in ["open", "close", "high", "low", "volume"]:
+‏        df[col] = pd.to_numeric(df[col], errors="coerce")
+‏    df["timestamp"] = pd.to_datetime(pd.to_numeric(df["timestamp"]), unit="s", utc=True)
+‏    df = df.dropna().drop_duplicates(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
 
-    now_ts = pd.Timestamp.now(tz="UTC")
-    df = df[(df["timestamp"] + pd.Timedelta(seconds=seconds)) <= now_ts].copy()
+‏    now_ts = pd.Timestamp.now(tz="UTC")
+‏    df = df[(df["timestamp"] + pd.Timedelta(seconds=seconds)) <= now_ts].copy()
 
-    if len(df) < SENKOU_B + DISPLACEMENT + 5:
-        raise RuntimeError(f"Not enough CLOSED candles for {symbol} {interval}: {len(df)}")
+‏    if len(df) < SENKOU_B + DISPLACEMENT + 5:
+‏        raise RuntimeError(f"Not enough CLOSED candles for {symbol} {interval}: {len(df)}")
 
-    return df.tail(CANDLE_LIMIT).reset_index(drop=True)
+‏    return df.tail(CANDLE_LIMIT).reset_index(drop=True)
 
 
-def fetch_all_klines(symbols, timeframes):
-    """Fetch every (symbol, timeframe) combination through a single shared
-    pool capped at MAX_WORKERS, instead of one pool per symbol processed
-    sequentially. Returns {symbol: {label: df_or_None}}; a None means that
-    fetch failed (logged here), and the caller decides how to handle it."""
-    results = {symbol: {} for symbol in symbols}
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-        futures = {
-            pool.submit(fetch_klines, symbol, interval): (symbol, label)
-            for symbol in symbols
-            for label, interval in timeframes.items()
+# =========================
+‏# INDICATORS
+# =========================
+‏def add_ichimoku(df):
+‏    high, low, close = df["high"], df["low"], df["close"]
+‏    df["tenkan"] = (high.rolling(TENKAN).max() + low.rolling(TENKAN).min()) / 2
+‏    df["kijun"] = (high.rolling(KIJUN).max() + low.rolling(KIJUN).min()) / 2
+‏    df["span_a"] = (df["tenkan"] + df["kijun"]) / 2
+‏    df["span_b"] = (high.rolling(SENKOU_B).max() + low.rolling(SENKOU_B).min()) / 2
+‏    df["cloud_top"] = df[["span_a", "span_b"]].max(axis=1)
+‏    df["cloud_bottom"] = df[["span_a", "span_b"]].min(axis=1)
+‏    df["kumo_thickness_pct"] = (df["cloud_top"] - df["cloud_bottom"]) / close * 100
+‏    return df
+
+
+‏def add_adx(df, period=ADX_PERIOD):
+‏    high, low, close = df["high"], df["low"], df["close"]
+‏    prev_close, prev_high, prev_low = close.shift(1), high.shift(1), low.shift(1)
+‏    tr = pd.concat(
+‏        [high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1
+‏    ).max(axis=1)
+‏    up_move, down_move = high - prev_high, prev_low - low
+‏    plus_dm = pd.Series(0.0, index=df.index)
+‏    minus_dm = pd.Series(0.0, index=df.index)
+‏    plus_dm[(up_move > down_move) & (up_move > 0)] = up_move
+‏    minus_dm[(down_move > up_move) & (down_move > 0)] = down_move
+‏    atr = tr.ewm(alpha=1 / period, adjust=False).mean()
+‏    plus_di = 100 * plus_dm.ewm(alpha=1 / period, adjust=False).mean() / atr
+‏    minus_di = 100 * minus_dm.ewm(alpha=1 / period, adjust=False).mean() / atr
+‏    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di)
+‏    df["adx"] = dx.ewm(alpha=1 / period, adjust=False).mean()
+‏    return df
+
+
+‏def add_ema(df, period=EMA_PERIOD):
+‏    df["ema"] = df["close"].ewm(span=period, adjust=False).mean()
+‏    return df
+
+
+‏def add_rsi(df, period=RSI_PERIOD):
+‏    delta = df["close"].diff()
+‏    gain = delta.clip(lower=0)
+‏    loss = -delta.clip(upper=0)
+‏    avg_gain = gain.ewm(alpha=1 / period, adjust=False).mean()
+‏    avg_loss = loss.ewm(alpha=1 / period, adjust=False).mean()
+‏    rs = avg_gain / avg_loss
+‏    df["rsi"] = 100 - (100 / (1 + rs))
+‏    return df
+
+
+‏def add_bollinger(df, period=BB_PERIOD, n_std=BB_STD):
+‏    sma = df["close"].rolling(period).mean()
+‏    std = df["close"].rolling(period).std()
+‏    df["bb_width_pct"] = (2 * n_std * std) / sma * 100
+‏    return df
+
+
+‏def add_volume_features(df, period=VOLUME_MA_PERIOD):
+‏    df["volume_ma"] = df["volume"].rolling(period).mean()
+‏    direction = df["close"].diff().apply(lambda x: 1 if x > 0 else (-1 if x < 0 else 0))
+‏    df["obv"] = (direction * df["volume"]).cumsum()
+‏    df["obv_slope"] = df["obv"].diff(5)
+‏    return df
+
+
+‏def add_swing_structure(df, window=SWING_WINDOW):
+‏    is_high = df["high"] == df["high"].rolling(2 * window + 1, center=True).max()
+‏    is_low = df["low"] == df["low"].rolling(2 * window + 1, center=True).min()
+‏    confirmed_high = is_high.shift(window).fillna(False)
+‏    confirmed_low = is_low.shift(window).fillna(False)
+‏    df["last_swing_high"] = df["high"].shift(window).where(confirmed_high).ffill()
+‏    df["last_swing_low"] = df["low"].shift(window).where(confirmed_low).ffill()
+‏    return df
+
+
+‏def build_indicators(df):
+‏    df = add_ichimoku(df)
+‏    df = add_adx(df)
+‏    df = add_ema(df)
+‏    df = add_rsi(df)
+‏    df = add_bollinger(df)
+‏    df = add_volume_features(df)
+‏    df = add_swing_structure(df)
+‏    return df
+
+
+# =========================
+‏# SIGNAL LOGIC (per timeframe)
+# =========================
+‏def compute_confirmations(df, i):
+‏    """Pure Ichimoku vote. This decides whether a signal exists at all.
+‏    RSI and every other indicator are checked afterwards, in
+‏    passes_extra_filters(), and only run once Ichimoku has already
+‏    confirmed a direction."""
+‏    close_s, span_a_s, span_b_s = df["close"], df["span_a"], df["span_b"]
+‏    row = df.iloc[i]
+‏    bull, bear = [], []
+
+‏    if row["close"] > row["cloud_top"]:
+‏        bull.append("Price > Kumo")
+‏    elif row["close"] < row["cloud_bottom"]:
+‏        bear.append("Price < Kumo")
+
+‏    if row["tenkan"] > row["kijun"]:
+‏        bull.append("Tenkan > Kijun")
+‏    elif row["tenkan"] < row["kijun"]:
+‏        bear.append("Tenkan < Kijun")
+
+‏    if row["span_a"] > row["span_b"]:
+‏        bull.append("Bullish Kumo")
+‏    elif row["span_a"] < row["span_b"]:
+‏        bear.append("Bearish Kumo")
+
+‏    if i >= DISPLACEMENT + SENKOU_B:
+‏        chikou = close_s.iloc[i - DISPLACEMENT]
+‏        hist_price = close_s.iloc[i - 2 * DISPLACEMENT]
+‏        hist_a = span_a_s.iloc[i - 2 * DISPLACEMENT]
+‏        hist_b = span_b_s.iloc[i - 2 * DISPLACEMENT]
+‏        if not any(pd.isna(v) for v in (chikou, hist_price, hist_a, hist_b)):
+‏            top, bottom = max(hist_a, hist_b), min(hist_a, hist_b)
+‏            if chikou > hist_price and chikou > top:
+‏                bull.append("Chikou bullish")
+‏            elif chikou < hist_price and chikou < bottom:
+‏                bear.append("Chikou bearish")
+
+‏    return bull, bear
+
+
+‏def passes_extra_filters(sig, row):
+‏    """All the non-Ichimoku filters, checked only after Ichimoku has
+‏    already confirmed a BUY/SELL direction. Returns (passed, list_of_failed_filter_names)."""
+‏    failed = []
+
+‏    if row["kumo_thickness_pct"] < KUMO_THICKNESS_MIN_PCT:
+‏        failed.append("thin_kumo")
+
+‏    margin = ((row["close"] - row["cloud_top"]) if sig == 1
+‏              else (row["cloud_bottom"] - row["close"])) / row["close"] * 100
+‏    if margin < BREAKOUT_MARGIN_PCT:
+‏        failed.append("weak_breakout")
+
+‏    if pd.isna(row.get("adx")) or row["adx"] < ADX_MIN:
+‏        failed.append("low_adx")
+
+‏    if pd.isna(row.get("ema")):
+‏        failed.append("ema_warmup")
+‏    elif (sig == 1 and row["close"] <= row["ema"]) or (sig == -1 and row["close"] >= row["ema"]):
+‏        failed.append("against_ema200")
+
+‏    if pd.isna(row.get("rsi")):
+‏        failed.append("rsi_warmup")
+‏    elif (sig == 1 and row["rsi"] >= RSI_MIDLINE) or (sig == -1 and row["rsi"] <= RSI_MIDLINE):
+‏        failed.append("rsi_not_confirming")
+
+‏    if pd.isna(row.get("bb_width_pct")) or row["bb_width_pct"] < BB_WIDTH_MIN_PCT:
+‏        failed.append("low_volatility")
+
+‏    if pd.isna(row.get("volume_ma")) or row["volume_ma"] == 0:
+‏        failed.append("volume_warmup")
+‏    else:
+‏        vol_ok = row["volume"] >= VOLUME_SPIKE_MULT * row["volume_ma"]
+‏        obv_ok = row["obv_slope"] > 0 if sig == 1 else row["obv_slope"] < 0
+‏        if not (vol_ok and obv_ok):
+‏            failed.append("no_volume_confirmation")
+
+‏    if sig == 1 and not pd.isna(row.get("last_swing_high")) and row["close"] < row["last_swing_high"]:
+‏        if (row["last_swing_high"] - row["close"]) / row["close"] * 100 > STRUCTURE_MARGIN_PCT:
+‏            failed.append("below_resistance")
+‏    if sig == -1 and not pd.isna(row.get("last_swing_low")) and row["close"] > row["last_swing_low"]:
+‏        if (row["close"] - row["last_swing_low"]) / row["close"] * 100 > STRUCTURE_MARGIN_PCT:
+‏            failed.append("above_support")
+
+‏    return len(failed) == 0, failed
+
+
+‏def analyze_timeframe(df):
+‏    df = build_indicators(df)
+‏    i = len(df) - 1
+‏    row = df.iloc[i]
+
+‏    if any(pd.isna(row.get(c)) for c in ["tenkan", "kijun", "span_a", "span_b"]):
+‏        return {"signal": "NEUTRAL", "confirmations": [], "price": float(row["close"])}
+
+‏    bull, bear = compute_confirmations(df, i)
+‏    bull_count, bear_count = len(bull), len(bear)
+
+‏    raw_signal, signal, confirmations = "NEUTRAL", "NEUTRAL", []
+‏    if bull_count >= MIN_CONFIRMATIONS and bull_count > bear_count:
+‏        raw_signal = signal = "BUY"
+‏        confirmations = bull
+‏    elif bear_count >= MIN_CONFIRMATIONS and bear_count > bull_count:
+‏        raw_signal = signal = "SELL"
+‏        confirmations = bear
+
+‏    # Only reached once Ichimoku itself has already confirmed a direction.
+‏    filters_failed = []
+‏    if signal != "NEUTRAL":
+‏        sig_num = 1 if signal == "BUY" else -1
+‏        passed, filters_failed = passes_extra_filters(sig_num, row)
+‏        if not passed:
+‏            signal, confirmations = "NEUTRAL", []
+
+‏    return {
+‏        "signal": signal,
+‏        "raw_signal": raw_signal,  # what Ichimoku alone said, before extra filters
+‏        "confirmations": confirmations,
+‏        "filters_failed": filters_failed,
+‏        "bull_count": bull_count,
+‏        "bear_count": bear_count,
+‏        "price": float(row["close"]),
+‏        "candle_time": df["timestamp"].iloc[i].isoformat(),
+    }
+
+
+# =========================
+‏# BTC CORRELATION (global gate)
+# =========================
+‏def get_btc_trend_4h():
+‏    """Returns 1 (bullish), -1 (bearish), or 0 (neutral) for BTC's 4h Ichimoku trend."""
+‏    df = fetch_klines(BTC_SYMBOL, BTC_CORRELATION_TF)
+‏    df = add_ichimoku(df)
+‏    i = len(df) - 1
+‏    row = df.iloc[i]
+‏    if any(pd.isna(row.get(c)) for c in ["tenkan", "kijun", "cloud_top", "cloud_bottom"]):
+‏        return 0
+‏    if row["close"] > row["cloud_top"] and row["tenkan"] > row["kijun"]:
+‏        return 1
+‏    if row["close"] < row["cloud_bottom"] and row["tenkan"] < row["kijun"]:
+‏        return -1
+‏    return 0
+
+
+# =========================
+‏# MULTI-TIMEFRAME
+# =========================
+‏def analyze_symbol(symbol):
+‏    results = {}
+‏    with ThreadPoolExecutor(max_workers=len(TIMEFRAMES)) as pool:
+‏        futures = {
+‏            pool.submit(fetch_klines, symbol, interval): label
+‏            for label, interval in TIMEFRAMES.items()
         }
-        for future in as_completed(futures):
-            symbol, label = futures[future]
-            try:
-                results[symbol][label] = future.result()
-            except Exception as exc:
-                log.warning("Fetch failed for %s %s: %s", symbol, label, exc)
-                results[symbol][label] = None
-    return results
+‏        for future in as_completed(futures):
+‏            label = futures[future]
+‏            df = future.result()
+‏            results[label] = analyze_timeframe(df)
+
+‏    buy_tfs = [tf for tf in TIMEFRAMES if results[tf]["signal"] == "BUY"]
+‏    sell_tfs = [tf for tf in TIMEFRAMES if results[tf]["signal"] == "SELL"]
+
+‏    if len(buy_tfs) >= MIN_TF_CONFIRMATIONS and len(buy_tfs) > len(sell_tfs):
+‏        final_signal = "BUY"
+‏    elif len(sell_tfs) >= MIN_TF_CONFIRMATIONS and len(sell_tfs) > len(buy_tfs):
+‏        final_signal = "SELL"
+‏    else:
+‏        final_signal = "NEUTRAL"
+
+‏    return final_signal, results, buy_tfs, sell_tfs
 
 
 # =========================
-# INDICATORS
+‏# TELEGRAM
 # =========================
-def add_ichimoku(df):
-    high, low, close = df["high"], df["low"], df["close"]
-    df["tenkan"] = (high.rolling(TENKAN).max() + low.rolling(TENKAN).min()) / 2
-    df["kijun"] = (high.rolling(KIJUN).max() + low.rolling(KIJUN).min()) / 2
-    df["span_a"] = (df["tenkan"] + df["kijun"]) / 2
-    df["span_b"] = (high.rolling(SENKOU_B).max() + low.rolling(SENKOU_B).min()) / 2
-    df["cloud_top"] = df[["span_a", "span_b"]].max(axis=1)
-    df["cloud_bottom"] = df[["span_a", "span_b"]].min(axis=1)
-    df["kumo_thickness_pct"] = (df["cloud_top"] - df["cloud_bottom"]) / close * 100
-    return df
+‏def send_telegram(text):
+‏    url = TELEGRAM_URL.format(TELEGRAM_BOT_TOKEN)
+‏    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "disable_web_page_preview": True}
+‏    r = SESSION.post(url, json=payload, timeout=15)
+‏    r.raise_for_status()
+‏    result = r.json()
+‏    if not result.get("ok"):
+‏        raise RuntimeError(f"Telegram error: {result}")
 
 
-def add_adx(df, period=ADX_PERIOD):
-    high, low, close = df["high"], df["low"], df["close"]
-    prev_close, prev_high, prev_low = close.shift(1), high.shift(1), low.shift(1)
-    tr = pd.concat(
-        [high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1
-    ).max(axis=1)
-    up_move, down_move = high - prev_high, prev_low - low
-    plus_dm = pd.Series(0.0, index=df.index)
-    minus_dm = pd.Series(0.0, index=df.index)
-    plus_dm[(up_move > down_move) & (up_move > 0)] = up_move
-    minus_dm[(down_move > up_move) & (down_move > 0)] = down_move
-    atr = tr.ewm(alpha=1 / period, adjust=False).mean()
-    plus_di = 100 * plus_dm.ewm(alpha=1 / period, adjust=False).mean() / atr
-    minus_di = 100 * minus_dm.ewm(alpha=1 / period, adjust=False).mean() / atr
-    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di)
-    df["adx"] = dx.ewm(alpha=1 / period, adjust=False).mean()
-    return df
+‏def fmt_price(price):
+‏    if price >= 1000:
+‏        return f"{price:,.2f}"
+‏    if price >= 1:
+‏        return f"{price:,.4f}"
+‏    if price >= 0.01:
+‏        return f"{price:,.6f}"
+‏    return f"{price:.8f}"
 
 
-def add_ema(df, period=EMA_PERIOD):
-    df["ema"] = df["close"].ewm(span=period, adjust=False).mean()
-    return df
-
-
-def add_rsi(df, period=RSI_PERIOD):
-    delta = df["close"].diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    avg_gain = gain.ewm(alpha=1 / period, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1 / period, adjust=False).mean()
-    rs = avg_gain / avg_loss
-    df["rsi"] = 100 - (100 / (1 + rs))
-    return df
-
-
-def add_bollinger(df, period=BB_PERIOD, n_std=BB_STD):
-    sma = df["close"].rolling(period).mean()
-    std = df["close"].rolling(period).std()
-    df["bb_width_pct"] = (2 * n_std * std) / sma * 100
-    return df
-
-
-def add_volume_features(df, period=VOLUME_MA_PERIOD):
-    df["volume_ma"] = df["volume"].rolling(period).mean()
-    direction = df["close"].diff().apply(lambda x: 1 if x > 0 else (-1 if x < 0 else 0))
-    df["obv"] = (direction * df["volume"]).cumsum()
-    df["obv_slope"] = df["obv"].diff(5)
-    return df
-
-
-def add_swing_structure(df, window=SWING_WINDOW):
-    is_high = df["high"] == df["high"].rolling(2 * window + 1, center=True).max()
-    is_low = df["low"] == df["low"].rolling(2 * window + 1, center=True).min()
-    confirmed_high = is_high.shift(window).fillna(False)
-    confirmed_low = is_low.shift(window).fillna(False)
-    df["last_swing_high"] = df["high"].shift(window).where(confirmed_high).ffill()
-    df["last_swing_low"] = df["low"].shift(window).where(confirmed_low).ffill()
-    return df
-
-
-def build_indicators(df):
-    df = add_ichimoku(df)
-    df = add_adx(df)
-    df = add_ema(df)
-    df = add_rsi(df)
-    df = add_bollinger(df)
-    df = add_volume_features(df)
-    df = add_swing_structure(df)
-    return df
-
-
-# =========================
-# SIGNAL LOGIC (per timeframe)
-# =========================
-def compute_confirmations(df, i):
-    """Pure Ichimoku vote. This decides whether a signal exists at all.
-    RSI and every other indicator are checked afterwards, in
-    passes_extra_filters(), and only run once Ichimoku has already
-    confirmed a direction."""
-    close_s, span_a_s, span_b_s = df["close"], df["span_a"], df["span_b"]
-    row = df.iloc[i]
-    bull, bear = [], []
-
-    if row["close"] > row["cloud_top"]:
-        bull.append("Price > Kumo")
-    elif row["close"] < row["cloud_bottom"]:
-        bear.append("Price < Kumo")
-
-    if row["tenkan"] > row["kijun"]:
-        bull.append("Tenkan > Kijun")
-    elif row["tenkan"] < row["kijun"]:
-        bear.append("Tenkan < Kijun")
-
-    if row["span_a"] > row["span_b"]:
-        bull.append("Bullish Kumo")
-    elif row["span_a"] < row["span_b"]:
-        bear.append("Bearish Kumo")
-
-    if i >= DISPLACEMENT + SENKOU_B:
-        chikou = close_s.iloc[i - DISPLACEMENT]
-        hist_price = close_s.iloc[i - 2 * DISPLACEMENT]
-        hist_a = span_a_s.iloc[i - 2 * DISPLACEMENT]
-        hist_b = span_b_s.iloc[i - 2 * DISPLACEMENT]
-        if not any(pd.isna(v) for v in (chikou, hist_price, hist_a, hist_b)):
-            top, bottom = max(hist_a, hist_b), min(hist_a, hist_b)
-            if chikou > hist_price and chikou > top:
-                bull.append("Chikou bullish")
-            elif chikou < hist_price and chikou < bottom:
-                bear.append("Chikou bearish")
-
-    return bull, bear
-
-
-def passes_extra_filters(sig, row):
-    """All the non-Ichimoku filters, checked only after Ichimoku has
-    already confirmed a BUY/SELL direction. Returns (passed, list_of_failed_filter_names)."""
-    failed = []
-
-    if row["kumo_thickness_pct"] < KUMO_THICKNESS_MIN_PCT:
-        failed.append("thin_kumo")
-
-    margin = ((row["close"] - row["cloud_top"]) if sig == 1
-              else (row["cloud_bottom"] - row["close"])) / row["close"] * 100
-    if margin < BREAKOUT_MARGIN_PCT:
-        failed.append("weak_breakout")
-
-    if pd.isna(row.get("adx")) or row["adx"] < ADX_MIN:
-        failed.append("low_adx")
-
-    if pd.isna(row.get("ema")):
-        failed.append("ema_warmup")
-    elif (sig == 1 and row["close"] <= row["ema"]) or (sig == -1 and row["close"] >= row["ema"]):
-        failed.append("against_ema200")
-
-    if pd.isna(row.get("rsi")):
-        failed.append("rsi_warmup")
-    elif (sig == 1 and row["rsi"] >= RSI_MIDLINE) or (sig == -1 and row["rsi"] <= RSI_MIDLINE):
-        failed.append("rsi_not_confirming")
-
-    if pd.isna(row.get("bb_width_pct")) or row["bb_width_pct"] < BB_WIDTH_MIN_PCT:
-        failed.append("low_volatility")
-
-    if pd.isna(row.get("volume_ma")) or row["volume_ma"] == 0:
-        failed.append("volume_warmup")
-    else:
-        vol_ok = row["volume"] >= VOLUME_SPIKE_MULT * row["volume_ma"]
-        obv_ok = row["obv_slope"] > 0 if sig == 1 else row["obv_slope"] < 0
-        if not (vol_ok and obv_ok):
-            failed.append("no_volume_confirmation")
-
-    if sig == 1 and not pd.isna(row.get("last_swing_high")) and row["close"] < row["last_swing_high"]:
-        if (row["last_swing_high"] - row["close"]) / row["close"] * 100 > STRUCTURE_MARGIN_PCT:
-            failed.append("below_resistance")
-    if sig == -1 and not pd.isna(row.get("last_swing_low")) and row["close"] > row["last_swing_low"]:
-        if (row["close"] - row["last_swing_low"]) / row["close"] * 100 > STRUCTURE_MARGIN_PCT:
-            failed.append("above_support")
-
-    return len(failed) == 0, failed
-
-
-def analyze_timeframe(df):
-    df = build_indicators(df)
-    i = len(df) - 1
-    row = df.iloc[i]
-
-    if any(pd.isna(row.get(c)) for c in ["tenkan", "kijun", "span_a", "span_b"]):
-        return {"signal": "NEUTRAL", "confirmations": [], "price": float(row["close"])}
-
-    bull, bear = compute_confirmations(df, i)
-    bull_count, bear_count = len(bull), len(bear)
-
-    raw_signal, signal, confirmations = "NEUTRAL", "NEUTRAL", []
-    if bull_count >= MIN_CONFIRMATIONS and bull_count > bear_count:
-        raw_signal = signal = "BUY"
-        confirmations = bull
-    elif bear_count >= MIN_CONFIRMATIONS and bear_count > bull_count:
-        raw_signal = signal = "SELL"
-        confirmations = bear
-
-    # Kept even if a later filter blocks the signal, purely so logging can
-    # still say *what Ichimoku confirmed* before explaining why it got vetoed.
-    raw_confirmations = list(confirmations)
-
-    # Only reached once Ichimoku itself has already confirmed a direction.
-    filters_failed = []
-    if signal != "NEUTRAL":
-        sig_num = 1 if signal == "BUY" else -1
-        passed, filters_failed = passes_extra_filters(sig_num, row)
-        if not passed:
-            signal, confirmations = "NEUTRAL", []
-
-    return {
-        "signal": signal,
-        "raw_signal": raw_signal,  # what Ichimoku alone said, before extra filters
-        "confirmations": confirmations,
-        "raw_confirmations": raw_confirmations,
-        "filters_failed": filters_failed,
-        "bull_count": bull_count,
-        "bear_count": bear_count,
-        "price": float(row["close"]),
-        "candle_time": df["timestamp"].iloc[i].isoformat(),
-    }
-
-
-# =========================
-# BTC CORRELATION (global gate)
-# =========================
-def get_btc_trend_4h(df=None):
-    """Returns 1 (bullish), -1 (bearish), or 0 (neutral) for BTC's 4h Ichimoku trend.
-
-    Pass in an already-fetched BTC 4h dataframe (scan_once does this, reusing
-    the same fetch used for BTC's own analysis) to avoid hitting the API for
-    BTC a second time every scan. Falls back to fetching it itself otherwise.
-    """
-    if df is None:
-        df = fetch_klines(BTC_SYMBOL, BTC_CORRELATION_TF)
-    df = add_ichimoku(df)
-    i = len(df) - 1
-    row = df.iloc[i]
-    if any(pd.isna(row.get(c)) for c in ["tenkan", "kijun", "cloud_top", "cloud_bottom"]):
-        return 0
-    if row["close"] > row["cloud_top"] and row["tenkan"] > row["kijun"]:
-        return 1
-    if row["close"] < row["cloud_bottom"] and row["tenkan"] < row["kijun"]:
-        return -1
-    return 0
-
-
-# =========================
-# MULTI-TIMEFRAME
-# =========================
-def analyze_symbol(symbol, symbol_klines):
-    """symbol_klines: {label: df} for this symbol, already fetched by
-    fetch_all_klines() in one shared concurrent wave for all symbols."""
-    missing = [tf for tf in TIMEFRAMES if symbol_klines.get(tf) is None]
-    if missing:
-        raise RuntimeError(f"Missing kline data for {symbol}: {missing}")
-
-    results = {label: analyze_timeframe(symbol_klines[label]) for label in TIMEFRAMES}
-
-    buy_tfs = [tf for tf in TIMEFRAMES if results[tf]["signal"] == "BUY"]
-    sell_tfs = [tf for tf in TIMEFRAMES if results[tf]["signal"] == "SELL"]
-
-    if len(buy_tfs) >= MIN_TF_CONFIRMATIONS and len(buy_tfs) > len(sell_tfs):
-        final_signal = "BUY"
-    elif len(sell_tfs) >= MIN_TF_CONFIRMATIONS and len(sell_tfs) > len(buy_tfs):
-        final_signal = "SELL"
-    else:
-        final_signal = "NEUTRAL"
-
-    return final_signal, results, buy_tfs, sell_tfs
-
-
-# =========================
-# TELEGRAM
-# =========================
-def send_telegram(text):
-    url = TELEGRAM_URL.format(TELEGRAM_BOT_TOKEN)
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "disable_web_page_preview": True}
-    r = SESSION.post(url, json=payload, timeout=15)
-    r.raise_for_status()
-    result = r.json()
-    if not result.get("ok"):
-        raise RuntimeError(f"Telegram error: {result}")
-
-
-def fmt_price(price):
-    if price >= 1000:
-        return f"{price:,.2f}"
-    if price >= 1:
-        return f"{price:,.4f}"
-    if price >= 0.01:
-        return f"{price:,.6f}"
-    return f"{price:.8f}"
-
-
-FILTER_LABELS = {
-    "thin_kumo": "thin cloud",
-    "weak_breakout": "weak breakout",
-    "low_adx": "no trend (ADX)",
-    "against_ema200": "against EMA200",
-    "ema_warmup": "EMA warmup",
-    "rsi_not_confirming": "RSI disagrees",
-    "rsi_warmup": "RSI warmup",
-    "low_volatility": "low volatility",
-    "no_volume_confirmation": "no volume confirm",
-    "volume_warmup": "volume warmup",
-    "below_resistance": "below resistance",
-    "above_support": "above support",
+‏FILTER_LABELS = {
+‏    "thin_kumo": "thin cloud",
+‏    "weak_breakout": "weak breakout",
+‏    "low_adx": "no trend (ADX)",
+‏    "against_ema200": "against EMA200",
+‏    "ema_warmup": "EMA warmup",
+‏    "rsi_not_confirming": "RSI disagrees",
+‏    "rsi_warmup": "RSI warmup",
+‏    "low_volatility": "low volatility",
+‏    "no_volume_confirmation": "no volume confirm",
+‏    "volume_warmup": "volume warmup",
+‏    "below_resistance": "below resistance",
+‏    "above_support": "above support",
 }
 
 
-def tf_line(tf, r):
-    """One compact line per timeframe: mark + label, and if Ichimoku wanted a
-    signal but an extra filter blocked it, show the top reason why."""
-    s = r["signal"]
-    mark = "🟢" if s == "BUY" else "🔴" if s == "SELL" else "⚪"
+‏def tf_line(tf, r):
+‏    """One compact line per timeframe: mark + label, and if Ichimoku wanted a
+‏    signal but an extra filter blocked it, show the top reason why."""
+‏    s = r["signal"]
+‏    mark = "🟢" if s == "BUY" else "🔴" if s == "SELL" else "⚪"
 
-    if s == "NEUTRAL" and r.get("raw_signal") in ("BUY", "SELL") and r.get("filters_failed"):
-        reasons = ", ".join(FILTER_LABELS.get(f, f) for f in r["filters_failed"][:2])
-        return f"{mark} {tf}: blocked ({reasons})"
+‏    if s == "NEUTRAL" and r.get("raw_signal") in ("BUY", "SELL") and r.get("filters_failed"):
+‏        reasons = ", ".join(FILTER_LABELS.get(f, f) for f in r["filters_failed"][:2])
+‏        return f"{mark} {tf}: blocked ({reasons})"
 
-    return f"{mark} {tf}: {s}"
+‏    return f"{mark} {tf}: {s}"
 
 
-def build_message(symbol, final_signal, results, buy_tfs, sell_tfs, btc_gate_blocked):
-    emoji = "🟢" if final_signal == "BUY" else "🔴" if final_signal == "SELL" else "⚪"
-    agreeing = buy_tfs if final_signal == "BUY" else sell_tfs if final_signal == "SELL" else []
+‏def build_message(symbol, final_signal, results, buy_tfs, sell_tfs, btc_gate_blocked):
+‏    emoji = "🟢" if final_signal == "BUY" else "🔴" if final_signal == "SELL" else "⚪"
+‏    agreeing = buy_tfs if final_signal == "BUY" else sell_tfs if final_signal == "SELL" else []
 
-    latest_price = results["15m"]["price"]
+‏    latest_price = results["15m"]["price"]
 
-    lines = [f"{emoji} {symbol} — {final_signal}", f"{fmt_price(latest_price)} USDT"]
+‏    lines = [f"{emoji} {symbol} — {final_signal}", f"{fmt_price(latest_price)} USDT"]
 
-    if agreeing:
-        lines.append(f"{len(agreeing)}/{len(TIMEFRAMES)} timeframes agree: {', '.join(agreeing)}")
-    if btc_gate_blocked:
-        lines.append("⚠️ blocked — BTC 4h trend disagrees")
+‏    if agreeing:
+‏        lines.append(f"{len(agreeing)}/{len(TIMEFRAMES)} timeframes agree: {', '.join(agreeing)}")
+‏    if btc_gate_blocked:
+‏        lines.append("⚠️ blocked — BTC 4h trend disagrees")
 
-    lines.append("")
-    for tf in TIMEFRAMES:
-        lines.append(tf_line(tf, results[tf]))
+‏    lines.append("")
+‏    for tf in TIMEFRAMES:
+‏        lines.append(tf_line(tf, results[tf]))
 
-    strong_tfs = [tf for tf in TIMEFRAMES if results[tf]["signal"] in ("BUY", "SELL")]
-    if strong_tfs:
-        lines.append("")
-        for tf in strong_tfs:
-            r = results[tf]
-            lines.append(f"{tf} confirmations: {' + '.join(r['confirmations'])}")
+‏    strong_tfs = [tf for tf in TIMEFRAMES if results[tf]["signal"] in ("BUY", "SELL")]
+‏    if strong_tfs:
+‏        lines.append("")
+‏        for tf in strong_tfs:
+‏            r = results[tf]
+‏            lines.append(f"{tf} confirmations: {' + '.join(r['confirmations'])}")
 
-    lines += ["", "⚠️ Technical signal only — not financial advice."]
-    return "\n".join(lines)
+‏    lines += ["", "⚠️ Technical signal only — not financial advice."]
+‏    return "\n".join(lines)
 
 
 # =========================
-# SCANNER
+‏# SCANNER
 # =========================
-BTC_TREND_LABEL = {1: "bullish", -1: "bearish", 0: "neutral"}
+‏def scan_once():
+‏    log.info("Starting scan...")
+
+‏    try:
+‏        btc_trend = get_btc_trend_4h()
+‏        log.info("BTC 4h trend gate: %s", btc_trend)
+‏    except Exception as exc:
+‏        log.warning("Could not fetch BTC trend for correlation filter (%s); gate disabled this scan.", exc)
+‏        btc_trend = None
+
+‏    for symbol in SYMBOLS:
+‏        try:
+‏            final_signal, results, buy_tfs, sell_tfs = analyze_symbol(symbol)
+‏            log.info("%s -> %s | BUY TFs=%s | SELL TFs=%s", symbol, final_signal, buy_tfs, sell_tfs)
+
+‏            has_any_signal = any(results[tf]["signal"] in ("BUY", "SELL") for tf in TIMEFRAMES)
+‏            if not has_any_signal:
+‏                log.info("%s: all timeframes NEUTRAL, skipping Telegram message.", symbol)
+‏                continue
+
+‏            btc_gate_blocked = False
+‏            if symbol != BTC_SYMBOL and btc_trend is not None and final_signal != "NEUTRAL":
+‏                sig_num = 1 if final_signal == "BUY" else -1
+‏                if (sig_num == 1 and btc_trend < 0) or (sig_num == -1 and btc_trend > 0):
+‏                    btc_gate_blocked = True
+‏                    final_signal = "NEUTRAL"
+
+‏            message = build_message(symbol, final_signal, results, buy_tfs, sell_tfs, btc_gate_blocked)
+‏            send_telegram(message)
+‏            log.info("Telegram sent for %s: %s", symbol, final_signal)
+
+‏        except Exception as exc:
+‏            log.exception("Error scanning %s: %s", symbol, exc)
+
+‏    log.info("Scan completed at %s", datetime.now(timezone.utc).isoformat())
 
 
-def log_timeframe_reasoning(symbol, tf, r):
-    """DEBUG-level breakdown of exactly why a timeframe ended up BUY/SELL/NEUTRAL."""
-    if r["signal"] in ("BUY", "SELL"):
-        log.debug(
-            "%s %s: %s confirmed — Ichimoku %d/%d (%s), all extra filters passed",
-            symbol, tf, r["signal"], max(r["bull_count"], r["bear_count"]),
-            MIN_CONFIRMATIONS, " + ".join(r["raw_confirmations"]),
-        )
-    elif r.get("raw_signal") in ("BUY", "SELL"):
-        log.debug(
-            "%s %s: Ichimoku confirmed %s (%s) but blocked by filter(s): %s",
-            symbol, tf, r["raw_signal"], " + ".join(r["raw_confirmations"]),
-            ", ".join(FILTER_LABELS.get(f, f) for f in r["filters_failed"]),
-        )
-    else:
-        log.debug(
-            "%s %s: NEUTRAL — Ichimoku bull=%d bear=%d (needs >=%d one-sided)",
-            symbol, tf, r["bull_count"], r["bear_count"], MIN_CONFIRMATIONS,
-        )
-
-
-def scan_once():
-    log.info("Starting scan...")
-    t0 = time.time()
-
-    klines = fetch_all_klines(SYMBOLS, TIMEFRAMES)
-    log.debug("Fetched all symbol/timeframe klines in %.2fs", time.time() - t0)
-
-    btc_df = klines.get(BTC_SYMBOL, {}).get(BTC_TF_LABEL)
-    try:
-        btc_trend = get_btc_trend_4h(btc_df)
-        log.info("BTC 4h trend gate: %s (%+d)", BTC_TREND_LABEL[btc_trend], btc_trend)
-    except Exception as exc:
-        log.warning("Could not determine BTC trend for correlation filter (%s); gate disabled this scan.", exc)
-        btc_trend = None
-
-    for symbol in SYMBOLS:
-        try:
-            final_signal, results, buy_tfs, sell_tfs = analyze_symbol(symbol, klines.get(symbol, {}))
-
-            for tf in TIMEFRAMES:
-                log_timeframe_reasoning(symbol, tf, results[tf])
-
-            has_any_signal = any(results[tf]["signal"] in ("BUY", "SELL") for tf in TIMEFRAMES)
-            if not has_any_signal:
-                log.info("%s: all timeframes NEUTRAL, skipping Telegram message.", symbol)
-                continue
-
-            if final_signal == "NEUTRAL":
-                log.info(
-                    "%s: BUY tfs=%s SELL tfs=%s — no one-sided majority (needs >=%d), "
-                    "final=NEUTRAL but still reporting since a signal exists",
-                    symbol, buy_tfs, sell_tfs, MIN_TF_CONFIRMATIONS,
-                )
-            else:
-                log.info(
-                    "%s: %s confirmed — %d/%d timeframes agree (%s)",
-                    symbol, final_signal, len(buy_tfs if final_signal == "BUY" else sell_tfs),
-                    len(TIMEFRAMES), ", ".join(buy_tfs if final_signal == "BUY" else sell_tfs),
-                )
-
-            btc_gate_blocked = False
-            if symbol != BTC_SYMBOL and btc_trend is not None and final_signal != "NEUTRAL":
-                sig_num = 1 if final_signal == "BUY" else -1
-                if (sig_num == 1 and btc_trend < 0) or (sig_num == -1 and btc_trend > 0):
-                    btc_gate_blocked = True
-                    log.info(
-                        "%s: %s blocked by BTC correlation gate (BTC 4h trend is %s) -> final=NEUTRAL",
-                        symbol, final_signal, BTC_TREND_LABEL[btc_trend],
-                    )
-                    final_signal = "NEUTRAL"
-
-            message = build_message(symbol, final_signal, results, buy_tfs, sell_tfs, btc_gate_blocked)
-            send_telegram(message)
-            log.info("Telegram sent for %s: %s", symbol, final_signal)
-
-        except Exception as exc:
-            log.exception("Error scanning %s: %s", symbol, exc)
-
-    log.info("Scan completed in %.2fs at %s", time.time() - t0, datetime.now(timezone.utc).isoformat())
-
-
-def main():
-    log.info("Ichimoku Telegram scanner started (full multi-indicator strategy).")
-    log.info("Symbols: %s", ", ".join(SYMBOLS))
-    log.info("Timeframes: %s", ", ".join(TIMEFRAMES))
-    log.info(
-        "Confirmations per timeframe: ALL 4 Ichimoku checks required first. "
-        "Only once Ichimoku confirms is a direction checked against the extra filters: "
-        "kumo thickness, breakout margin, ADX>=%d, EMA%d trend, RSI vs %d midline, "
-        "Bollinger width>=%.1f%%, volume/OBV confirmation, market structure. "
-        "Plus a global BTC-4h-trend correlation gate for altcoins. "
-        "A symbol is skipped (no Telegram message) when every timeframe is NEUTRAL; "
-        "otherwise it's sent every scan regardless of whether the signal changed.",
-        ADX_MIN, EMA_PERIOD, RSI_MIDLINE, BB_WIDTH_MIN_PCT,
+‏def main():
+‏    log.info("Ichimoku Telegram scanner started (full multi-indicator strategy).")
+‏    log.info("Symbols: %s", ", ".join(SYMBOLS))
+‏    log.info("Timeframes: %s", ", ".join(TIMEFRAMES))
+‏    log.info(
+‏        "Confirmations per timeframe: ALL 4 Ichimoku checks required first. "
+‏        "Only once Ichimoku confirms is a direction checked against the extra filters: "
+‏        "kumo thickness, breakout margin, ADX>=%d, EMA%d trend, RSI vs %d midline, "
+‏        "Bollinger width>=%.1f%%, volume/OBV confirmation, market structure. "
+‏        "Plus a global BTC-4h-trend correlation gate for altcoins. "
+‏        "A symbol is skipped (no Telegram message) when every timeframe is NEUTRAL; "
+‏        "otherwise it's sent every scan regardless of whether the signal changed.",
+‏        ADX_MIN, EMA_PERIOD, RSI_MIDLINE, BB_WIDTH_MIN_PCT,
     )
-    scan_once()
+‏    scan_once()
 
 
-if __name__ == "__main__":
-    main()
+‏if __name__ == "__main__":
+‏    main()
