@@ -158,7 +158,7 @@ def fetch_klines(symbol, interval):
         "symbol": symbol, "tradeType": "SPOT", "klineType": "TRADE",
         "interval": interval, "startAt": start_at, "endAt": now,
     }
-    r = SESSION.get(KUCOIN_URL, params=params, timeout=15)
+    r = SESSION.get(BINANCE_URL, params=params, timeout=15)
     r.raise_for_status()
     payload = r.json()
 
