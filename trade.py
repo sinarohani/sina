@@ -14,57 +14,57 @@ load_dotenv()
 # =========================
 # CONFIG
 # =========================
-KUCOIN_URL = "https://api.kucoin.com/api/ua/v2/market/kline"
+BINANCE_URL = "https://api.binance.com/api/v3/klines"
 TELEGRAM_URL = "https://api.telegram.org/bot{}/sendMessage"
 
 SYMBOLS = [
-    "BTC-USDT",
-    "ETH-USDT",
-    "BNB-USDT",
-    "XRP-USDT",
-    "SOL-USDT",
-    "TRX-USDT",
-    "ZEC-USDT",
-    "HYPE-USDT",
-    "DOGE-USDT",
-    "LINK-USDT",
-    "XMR-USDT",
-    "ADA-USDT",
-    "LEO-USDT",
-    "XLM-USDT",
-    "BCH-USDT",
-    "NEAR-USDT",
-    "UNI-USDT",
-    "LTC-USDT",
-    "CC-USDT",
-    "AVAX-USDT",
-    "SUI-USDT",
-    "TON-USDT",
-    "HBAR-USDT",
-    "TAO-USDT",
-    "SHIB-USDT",
-    "CRO-USDT",
-    "M-USDT",
-    "ENA-USDT",
-    "ONDO-USDT",
-    "OKB-USDT",
-    "AAVE-USDT",
-    "MNT-USDT",
-    "DOT-USDT",
-    "PUMP-USDT",
-    "ASTER-USDT",
-    "WLD-USDT",
-    "WLFI-USDT",
-    "SKY-USDT",
-    "PEPE-USDT",
-    "ICP-USDT",
+    "BTCUSDT",
+    "ETHUSDT",
+    "BNBUSDT",
+    "XRPUSDT",
+    "SOLUSDT",
+    "TRXUSDT",
+    "ZECUSDT",
+    "HYPEUSDT",
+    "DOGEUSDT",
+    "LINKUSDT",
+    "XMRUSDT",
+    "ADAUSDT",
+    "XLMUSDT",
+    "BCHUSDT",
+    "NEARUSDT",
+    "UNIUSDT",
+    "LTCUSDT",
+    "CCUSDT",
+    "AVAXUSDT",
+    "SUIUSDT",
+    "HBARUSDT",
+    "TAOUSDT",
+    "SHIBUSDT",
+    "CROUSDT",
+    "ENAUSDT",
+    "ONDOUSDT",
+    "AAVEUSDT",
+    "MNTUSDT",
+    "DOTUSDT",
+    "PUMPUSDT",
+    "ASTERUSDT",
+    "WLDUSDT",
+    "WLFIUSDT",
+    "SKYUSDT",
+    "PEPEUSDT",
+    "ICPUSDT",
+    "ARBUSDT",
+    "ETCUSDT",
+    "KASUSDT",
+    "POLUSDT",
 ]
 
 TIMEFRAMES = {
-    "15m": "15min",
-    "1h": "1hour",
-    "4h": "4hour",
-    "1D": "1day",
+    "15m": "15m",
+    "1h": "1h",
+    "4h": "4h",
+    "1D": "1d",
 }
 
 # --- Ichimoku ---
@@ -95,8 +95,8 @@ STRUCTURE_MARGIN_PCT = 0.25
 
 # BTC correlation is a global gate applied to the final combined signal,
 # using BTC's own 4h Ichimoku trend. Skipped for BTC itself.
-BTC_SYMBOL = "BTC-USDT"
-BTC_CORRELATION_TF = "4hour"
+BTC_SYMBOL = "BTCUSDT"
+BTC_CORRELATION_TF = "4h"
 
 # Need enough closed candles for EMA200 warmup + Ichimoku displacement on
 # every timeframe, including 1-day (200 daily candles = ~200 days back).
