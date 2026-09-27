@@ -1,4 +1,5 @@
 import os
+import time
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
@@ -13,57 +14,23 @@ load_dotenv()
 # =========================
 # CONFIG
 # =========================
-BINANCE_URL = "https://api.binance.com/api/v3/klines"
+KUCOIN_URL = "https://api.kucoin.com/api/ua/v2/market/kline"
 TELEGRAM_URL = "https://api.telegram.org/bot{}/sendMessage"
 
 SYMBOLS = [
-    "BTCUSDT",
-    "ETHUSDT",
-    "BNBUSDT",
-    "XRPUSDT",
-    "SOLUSDT",
-    "TRXUSDT",
-    "ZECUSDT",
-    "HYPEUSDT",
-    "DOGEUSDT",
-    "LINKUSDT",
-    "XMRUSDT",
-    "ADAUSDT",
-    "XLMUSDT",
-    "BCHUSDT",
-    "NEARUSDT",
-    "UNIUSDT",
-    "LTCUSDT",
-    "CCUSDT",
-    "AVAXUSDT",
-    "SUIUSDT",
-    "HBARUSDT",
-    "TAOUSDT",
-    "SHIBUSDT",
-    "CROUSDT",
-    "ENAUSDT",
-    "ONDOUSDT",
-    "AAVEUSDT",
-    "MNTUSDT",
-    "DOTUSDT",
-    "PUMPUSDT",
-    "ASTERUSDT",
-    "WLDUSDT",
-    "WLFIUSDT",
-    "SKYUSDT",
-    "PEPEUSDT",
-    "ICPUSDT",
-    "ARBUSDT",
-    "ETCUSDT",
-    "KASUSDT",
-    "POLUSDT",
+    "BTC-USDT",
+    "ETH-USDT",
+    "SOL-USDT",
+    "DOGE-USDT",
+    "POL-USDT",
+    "LINK-USDT",
 ]
 
 TIMEFRAMES = {
-    "15m": "15m",
-    "1h": "1h",
-    "4h": "4h",
-    "1D": "1d",
+    "15m": "15min",
+    "1h": "1hour",
+    "4h": "4hour",
+    "1D": "1day",
 }
 
 # --- Ichimoku ---
@@ -81,6 +48,8 @@ ADX_MIN = 20
 EMA_PERIOD = 200
 
 RSI_PERIOD = 14
+RSI_OVERBOUGHT = 65
+RSI_OVERSOLD = 35
 
 BB_PERIOD = 20
 BB_STD = 2
@@ -94,8 +63,8 @@ STRUCTURE_MARGIN_PCT = 0.25
 
 # BTC correlation is a global gate applied to the final combined signal,
 # using BTC's own 4h Ichimoku trend. Skipped for BTC itself.
-BTC_SYMBOL = "BTCUSDT"
-BTC_CORRELATION_TF = "4h"
+BTC_SYMBOL = "BTC-USDT"
+BTC_CORRELATION_TF = "4hour"
 
 # Need enough closed candles for EMA200 warmup + Ichimoku displacement on
 # every timeframe, including 1-day (200 daily candles = ~200 days back).
@@ -142,40 +111,39 @@ SESSION = build_session()
 
 
 # =========================
-# BINANCE
+# KUCOIN
 # =========================
 def interval_to_seconds(interval):
-    return {"15m": 15 * 60, "1h": 3600, "4h": 4 * 3600, "1d": 86400}[interval]
+    return {"15min": 15 * 60, "1hour": 3600, "4hour": 4 * 3600, "1day": 86400}[interval]
 
 
 def fetch_klines(symbol, interval):
     seconds = interval_to_seconds(interval)
+    now = int(time.time())
+    start_at = now - (CANDLE_LIMIT + CANDLE_FETCH_BUFFER) * seconds
+
     params = {
-        "symbol": symbol,
-        "interval": interval,
-        "limit": CANDLE_LIMIT + CANDLE_FETCH_BUFFER,
+        "symbol": symbol, "tradeType": "SPOT", "klineType": "TRADE",
+        "interval": interval, "startAt": start_at, "endAt": now,
     }
-    r = SESSION.get(BINANCE_URL, params=params, timeout=15)
+    r = SESSION.get(KUCOIN_URL, params=params, timeout=15)
     r.raise_for_status()
     payload = r.json()
 
-    if isinstance(payload, dict):
-        # Binance returns an error object instead of a list on failure,
-        # e.g. {"code": -1121, "msg": "Invalid symbol."}
-        raise RuntimeError(f"Binance error: {payload}")
+    if payload.get("code") != "200000":
+        raise RuntimeError(f"KuCoin error: {payload}")
 
-    rows = payload
+    rows = payload.get("data", {}).get("list", [])
     if not rows:
         raise RuntimeError(f"No kline data for {symbol} {interval}")
 
-    df = pd.DataFrame(rows, columns=[
-        "open_time", "open", "high", "low", "close", "volume", "close_time",
-        "quote_volume", "trades", "taker_buy_base", "taker_buy_quote", "ignore",
-    ])
-    for col in ["open", "high", "low", "close", "volume"]:
+    rows.sort(key=lambda x: int(x[0]))
+    df = pd.DataFrame(
+        rows, columns=["timestamp", "open", "close", "high", "low", "volume", "turnover"]
+    )
+    for col in ["open", "close", "high", "low", "volume"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
-    df["timestamp"] = pd.to_datetime(pd.to_numeric(df["open_time"]), unit="ms", utc=True)
-    df = df[["timestamp", "open", "high", "low", "close", "volume"]]
+    df["timestamp"] = pd.to_datetime(pd.to_numeric(df["timestamp"]), unit="s", utc=True)
     df = df.dropna().drop_duplicates(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
 
     now_ts = pd.Timestamp.now(tz="UTC")
@@ -277,13 +245,6 @@ def build_indicators(df):
 # SIGNAL LOGIC (per timeframe)
 # =========================
 def compute_confirmations(df, i):
-    """
-    Pure Ichimoku confirmations only (4 checks). This runs FIRST and decides
-    whether there is a candidate BUY/SELL at all. RSI is deliberately NOT
-    part of this step - it is only checked afterwards, in
-    passes_extra_filters(), and only for a symbol/timeframe that already has
-    a full Ichimoku confirmation.
-    """
     close_s, span_a_s, span_b_s = df["close"], df["span_a"], df["span_b"]
     row = df.iloc[i]
     bull, bear = [], []
@@ -315,15 +276,15 @@ def compute_confirmations(df, i):
             elif chikou < hist_price and chikou < bottom:
                 bear.append("Chikou bearish")
 
+    # RSI is intentionally NOT a BUY/SELL vote.
+    # A signal must first have complete Ichimoku confirmation.
+    # RSI remains calculated for monitoring/future optional filtering only.
+
     return bull, bear
 
 
 def passes_extra_filters(sig, row):
-    """
-    All the non-Ichimoku filters. Only called once Ichimoku has already
-    fully confirmed a BUY (sig=1) or SELL (sig=-1) candidate.
-    Returns (passed, list_of_failed_filter_names).
-    """
+    """All the non-Ichimoku filters. Returns (passed, list_of_failed_filter_names)."""
     failed = []
 
     if row["kumo_thickness_pct"] < KUMO_THICKNESS_MIN_PCT:
@@ -341,15 +302,6 @@ def passes_extra_filters(sig, row):
         failed.append("ema_warmup")
     elif (sig == 1 and row["close"] <= row["ema"]) or (sig == -1 and row["close"] >= row["ema"]):
         failed.append("against_ema200")
-
-    # --- RSI check: runs only after Ichimoku is fully confirmed.
-    # Midline rule: RSI < 50 confirms BUY, RSI > 50 confirms SELL. ---
-    if pd.isna(row.get("rsi")):
-        failed.append("rsi_warmup")
-    elif sig == 1 and row["rsi"] >= 50:
-        failed.append("rsi_not_bullish")
-    elif sig == -1 and row["rsi"] <= 50:
-        failed.append("rsi_not_bearish")
 
     if pd.isna(row.get("bb_width_pct")) or row["bb_width_pct"] < BB_WIDTH_MIN_PCT:
         failed.append("low_volatility")
@@ -372,16 +324,14 @@ def passes_extra_filters(sig, row):
     return len(failed) == 0, failed
 
 
-def analyze_timeframe(symbol, tf, df):
+def analyze_timeframe(df):
     df = build_indicators(df)
     i = len(df) - 1
     row = df.iloc[i]
 
     if any(pd.isna(row.get(c)) for c in ["tenkan", "kijun", "span_a", "span_b"]):
-        log.info("%s %s: SKIP - Ichimoku still warming up (not enough closed candles yet)", symbol, tf)
         return {"signal": "NEUTRAL", "confirmations": [], "price": float(row["close"])}
 
-    # --- Stage 1: Ichimoku vote count ---
     bull, bear = compute_confirmations(df, i)
     bull_count, bear_count = len(bull), len(bear)
 
@@ -393,36 +343,22 @@ def analyze_timeframe(symbol, tf, df):
         raw_signal = signal = "SELL"
         confirmations = bear
 
-    if raw_signal == "NEUTRAL":
-        log.info(
-            "%s %s: NEUTRAL - Ichimoku not aligned (bull %d/%d: %s | bear %d/%d: %s, need >=%d one-sided)",
-            symbol, tf, bull_count, MIN_CONFIRMATIONS, bull or "-",
-            bear_count, MIN_CONFIRMATIONS, bear or "-", MIN_CONFIRMATIONS,
-        )
-        return {"signal": "NEUTRAL", "raw_signal": "NEUTRAL", "confirmations": [],
-                "filters_failed": [], "price": float(row["close"])}
-
-    log.info("%s %s: Ichimoku confirmed %s (%s) -> checking extra filters",
-              symbol, tf, raw_signal, ", ".join(confirmations))
-
-    # --- Stage 2: extra filters, only reached once Ichimoku fully agrees ---
-    sig_num = 1 if raw_signal == "BUY" else -1
-    passed, filters_failed = passes_extra_filters(sig_num, row)
-
-    if passed:
-        log.info("%s %s: PASSED all extra filters -> final signal %s", symbol, tf, raw_signal)
-        signal = raw_signal
-    else:
-        reasons = ", ".join(FILTER_LABELS.get(f, f) for f in filters_failed)
-        log.info("%s %s: BLOCKED - %s failed [%s]", symbol, tf, raw_signal, reasons)
-        signal, confirmations = "NEUTRAL", []
+    filters_failed = []
+    if signal != "NEUTRAL":
+        sig_num = 1 if signal == "BUY" else -1
+        passed, filters_failed = passes_extra_filters(sig_num, row)
+        if not passed:
+            signal, confirmations = "NEUTRAL", []
 
     return {
         "signal": signal,
         "raw_signal": raw_signal,  # what Ichimoku alone said, before extra filters
         "confirmations": confirmations,
         "filters_failed": filters_failed,
+        "bull_count": bull_count,
+        "bear_count": bear_count,
         "price": float(row["close"]),
+        "candle_time": df["timestamp"].iloc[i].isoformat(),
     }
 
 
@@ -457,7 +393,7 @@ def analyze_symbol(symbol):
         for future in as_completed(futures):
             label = futures[future]
             df = future.result()
-            results[label] = analyze_timeframe(symbol, label, df)
+            results[label] = analyze_timeframe(df)
 
     buy_tfs = [tf for tf in TIMEFRAMES if results[tf]["signal"] == "BUY"]
     sell_tfs = [tf for tf in TIMEFRAMES if results[tf]["signal"] == "SELL"]
@@ -501,9 +437,6 @@ FILTER_LABELS = {
     "low_adx": "no trend (ADX)",
     "against_ema200": "against EMA200",
     "ema_warmup": "EMA warmup",
-    "rsi_not_bullish": "RSI above 50",
-    "rsi_not_bearish": "RSI below 50",
-    "rsi_warmup": "RSI warmup",
     "low_volatility": "low volatility",
     "no_volume_confirmation": "no volume confirm",
     "volume_warmup": "volume warmup",
@@ -569,21 +502,11 @@ def scan_once():
     for symbol in SYMBOLS:
         try:
             final_signal, results, buy_tfs, sell_tfs = analyze_symbol(symbol)
-
-            if final_signal == "NEUTRAL":
-                log.info(
-                    "%s: NEUTRAL overall - only %d BUY tf(s) %s and %d SELL tf(s) %s, need >=%d agreeing one-sided",
-                    symbol, len(buy_tfs), buy_tfs or "-", len(sell_tfs), sell_tfs or "-", MIN_TF_CONFIRMATIONS,
-                )
-            else:
-                log.info("%s: %d/%d timeframes agree on %s (%s)",
-                          symbol, len(buy_tfs if final_signal == "BUY" else sell_tfs),
-                          len(TIMEFRAMES), final_signal,
-                          ", ".join(buy_tfs if final_signal == "BUY" else sell_tfs))
+            log.info("%s -> %s | BUY TFs=%s | SELL TFs=%s", symbol, final_signal, buy_tfs, sell_tfs)
 
             has_any_signal = any(results[tf]["signal"] in ("BUY", "SELL") for tf in TIMEFRAMES)
             if not has_any_signal:
-                log.info("%s: SKIP Telegram - every timeframe NEUTRAL", symbol)
+                log.info("%s: all timeframes NEUTRAL, skipping Telegram message.", symbol)
                 continue
 
             btc_gate_blocked = False
@@ -591,13 +514,11 @@ def scan_once():
                 sig_num = 1 if final_signal == "BUY" else -1
                 if (sig_num == 1 and btc_trend < 0) or (sig_num == -1 and btc_trend > 0):
                     btc_gate_blocked = True
-                    log.info("%s: BLOCKED - %s disagrees with BTC 4h trend (%s)",
-                              symbol, final_signal, btc_trend)
                     final_signal = "NEUTRAL"
 
             message = build_message(symbol, final_signal, results, buy_tfs, sell_tfs, btc_gate_blocked)
             send_telegram(message)
-            log.info("%s: Telegram sent - final signal %s", symbol, final_signal)
+            log.info("Telegram sent for %s: %s", symbol, final_signal)
 
         except Exception as exc:
             log.exception("Error scanning %s: %s", symbol, exc)
@@ -610,9 +531,8 @@ def main():
     log.info("Symbols: %s", ", ".join(SYMBOLS))
     log.info("Timeframes: %s", ", ".join(TIMEFRAMES))
     log.info(
-        "Confirmations per timeframe: ALL 4 Ichimoku checks required first. "
-        "Only if Ichimoku fully confirms is the signal then checked against: "
-        "RSI vs 50 midline (BUY needs RSI<50, SELL needs RSI>50), kumo thickness, breakout margin, ADX>=%d, "
+        "Confirmations per timeframe: ALL 4 Ichimoku checks required (RSI is not a signal vote). "
+        "Filters per timeframe: kumo thickness, breakout margin, ADX>=%d, "
         "EMA%d trend, Bollinger width>=%.1f%%, volume/OBV confirmation, "
         "market structure. Plus a global BTC-4h-trend correlation gate for altcoins. "
         "A symbol is skipped (no Telegram message) when every timeframe is NEUTRAL; "
@@ -624,4 +544,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
