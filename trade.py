@@ -35,7 +35,7 @@ TIMEFRAMES = {
 
 # --- Ichimoku ---
 TENKAN, KIJUN, SENKOU_B, DISPLACEMENT = 9, 26, 52, 26
-MIN_CONFIRMATIONS = 2
+MIN_CONFIRMATIONS = 4  # Require all 4 Ichimoku confirmations
 MIN_TF_CONFIRMATIONS = 2
 
 # --- Extra filters (all applied per-timeframe unless noted) ---
@@ -276,11 +276,9 @@ def compute_confirmations(df, i):
             elif chikou < hist_price and chikou < bottom:
                 bear.append("Chikou bearish")
 
-    if not pd.isna(row.get("rsi")):
-        if row["rsi"] < RSI_OVERSOLD:
-            bull.append(f"RSI oversold (<{RSI_OVERSOLD})")
-        elif row["rsi"] > RSI_OVERBOUGHT:
-            bear.append(f"RSI overbought (>{RSI_OVERBOUGHT})")
+    # RSI is intentionally NOT a BUY/SELL vote.
+    # A signal must first have complete Ichimoku confirmation.
+    # RSI remains calculated for monitoring/future optional filtering only.
 
     return bull, bear
 
@@ -533,13 +531,13 @@ def main():
     log.info("Symbols: %s", ", ".join(SYMBOLS))
     log.info("Timeframes: %s", ", ".join(TIMEFRAMES))
     log.info(
-        "Confirmations per timeframe: 4 Ichimoku checks + RSI(%d) vote (<%d=bull, >%d=bear). "
+        "Confirmations per timeframe: ALL 4 Ichimoku checks required (RSI is not a signal vote). "
         "Filters per timeframe: kumo thickness, breakout margin, ADX>=%d, "
         "EMA%d trend, Bollinger width>=%.1f%%, volume/OBV confirmation, "
         "market structure. Plus a global BTC-4h-trend correlation gate for altcoins. "
         "A symbol is skipped (no Telegram message) when every timeframe is NEUTRAL; "
         "otherwise it's sent every scan regardless of whether the signal changed.",
-        RSI_PERIOD, RSI_OVERSOLD, RSI_OVERBOUGHT, ADX_MIN, EMA_PERIOD, BB_WIDTH_MIN_PCT,
+        ADX_MIN, EMA_PERIOD, BB_WIDTH_MIN_PCT,
     )
     scan_once()
 
