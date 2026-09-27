@@ -48,8 +48,6 @@ ADX_MIN = 20
 EMA_PERIOD = 200
 
 RSI_PERIOD = 14
-RSI_OVERBOUGHT = 65
-RSI_OVERSOLD = 35
 
 BB_PERIOD = 20
 BB_STD = 2
@@ -340,14 +338,16 @@ def passes_extra_filters(sig, row):
     return len(failed) == 0, failed
 
 
-def analyze_timeframe(df):
+def analyze_timeframe(symbol, tf, df):
     df = build_indicators(df)
     i = len(df) - 1
     row = df.iloc[i]
 
     if any(pd.isna(row.get(c)) for c in ["tenkan", "kijun", "span_a", "span_b"]):
+        log.info("%s %s: SKIP - Ichimoku still warming up (not enough closed candles yet)", symbol, tf)
         return {"signal": "NEUTRAL", "confirmations": [], "price": float(row["close"])}
 
+    # --- Stage 1: Ichimoku vote count ---
     bull, bear = compute_confirmations(df, i)
     bull_count, bear_count = len(bull), len(bear)
 
@@ -359,22 +359,36 @@ def analyze_timeframe(df):
         raw_signal = signal = "SELL"
         confirmations = bear
 
-    filters_failed = []
-    if signal != "NEUTRAL":
-        sig_num = 1 if signal == "BUY" else -1
-        passed, filters_failed = passes_extra_filters(sig_num, row)
-        if not passed:
-            signal, confirmations = "NEUTRAL", []
+    if raw_signal == "NEUTRAL":
+        log.info(
+            "%s %s: NEUTRAL - Ichimoku not aligned (bull %d/%d: %s | bear %d/%d: %s, need >=%d one-sided)",
+            symbol, tf, bull_count, MIN_CONFIRMATIONS, bull or "-",
+            bear_count, MIN_CONFIRMATIONS, bear or "-", MIN_CONFIRMATIONS,
+        )
+        return {"signal": "NEUTRAL", "raw_signal": "NEUTRAL", "confirmations": [],
+                "filters_failed": [], "price": float(row["close"])}
+
+    log.info("%s %s: Ichimoku confirmed %s (%s) -> checking extra filters",
+              symbol, tf, raw_signal, ", ".join(confirmations))
+
+    # --- Stage 2: extra filters, only reached once Ichimoku fully agrees ---
+    sig_num = 1 if raw_signal == "BUY" else -1
+    passed, filters_failed = passes_extra_filters(sig_num, row)
+
+    if passed:
+        log.info("%s %s: PASSED all extra filters -> final signal %s", symbol, tf, raw_signal)
+        signal = raw_signal
+    else:
+        reasons = ", ".join(FILTER_LABELS.get(f, f) for f in filters_failed)
+        log.info("%s %s: BLOCKED - %s failed [%s]", symbol, tf, raw_signal, reasons)
+        signal, confirmations = "NEUTRAL", []
 
     return {
         "signal": signal,
         "raw_signal": raw_signal,  # what Ichimoku alone said, before extra filters
         "confirmations": confirmations,
         "filters_failed": filters_failed,
-        "bull_count": bull_count,
-        "bear_count": bear_count,
         "price": float(row["close"]),
-        "candle_time": df["timestamp"].iloc[i].isoformat(),
     }
 
 
@@ -409,7 +423,7 @@ def analyze_symbol(symbol):
         for future in as_completed(futures):
             label = futures[future]
             df = future.result()
-            results[label] = analyze_timeframe(df)
+            results[label] = analyze_timeframe(symbol, label, df)
 
     buy_tfs = [tf for tf in TIMEFRAMES if results[tf]["signal"] == "BUY"]
     sell_tfs = [tf for tf in TIMEFRAMES if results[tf]["signal"] == "SELL"]
