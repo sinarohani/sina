@@ -371,12 +371,12 @@ def passes_extra_filters(sig, row):
 
     # --- RSI check: runs only after Ichimoku is fully confirmed.
     # Midline rule: RSI < 50 confirms BUY, RSI > 50 confirms SELL. ---
-    if pd.isna(row.get("rsi")):
-        failed.append("rsi_warmup")
-    elif sig == 1 and row["rsi"] >= 50:
-        failed.append("rsi_not_bullish")
-    elif sig == -1 and row["rsi"] <= 50:
-        failed.append("rsi_not_bearish")
+    # if pd.isna(row.get("rsi")):
+        # failed.append("rsi_warmup")
+    # elif sig == 1 and row["rsi"] >= 50:
+        # failed.append("rsi_not_bullish")
+    # elif sig == -1 and row["rsi"] <= 50:
+        # failed.append("rsi_not_bearish")
 
     if pd.isna(row.get("bb_width_pct")) or row["bb_width_pct"] < BB_WIDTH_MIN_PCT:
         failed.append("low_volatility")
