@@ -1,4 +1,5 @@
 import os
+import json
 import time
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -132,6 +133,7 @@ CANDLE_FETCH_BUFFER = 60  # extra candles requested beyond CANDLE_LIMIT
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 MAX_WORKERS = 6
+STATE_FILE = os.getenv("STATE_FILE", "signal_state.json")
 
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
@@ -581,6 +583,36 @@ def build_message(symbol, final_signal, results, buy_tfs, sell_tfs, btc_gate_blo
 
 
 # =========================
+# SIGNAL STATE (dedupe: only send when the signal is new/changed)
+# =========================
+def load_state():
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except Exception as exc:
+        log.warning("Could not read %s (%s); starting with empty state.", STATE_FILE, exc)
+        return {}
+
+
+def save_state(state):
+    try:
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=1, sort_keys=True)
+    except Exception as exc:
+        log.warning("Could not write %s (%s)", STATE_FILE, exc)
+
+
+def signal_key(final_signal, results):
+    """Fingerprint of what would be sent: final signal + which timeframes fired."""
+    fired = [f"{tf}={results[tf]['signal']}" for tf in TIMEFRAMES
+             if results[tf]["signal"] in ("BUY", "SELL")]
+    return f"{final_signal}|" + ",".join(fired)
+
+
+# =========================
 # SCANNER
 # =========================
 def scan_once():
@@ -592,6 +624,9 @@ def scan_once():
     except Exception as exc:
         log.warning("Could not fetch BTC trend for correlation filter (%s); gate disabled this scan.", exc)
         btc_trend = None
+
+    state = load_state()
+    new_state = dict(state)
 
     for symbol in SYMBOLS:
         try:
@@ -611,6 +646,7 @@ def scan_once():
             has_any_signal = any(results[tf]["signal"] in ("BUY", "SELL") for tf in TIMEFRAMES)
             if not has_any_signal:
                 log.info("%s: SKIP Telegram - every timeframe NEUTRAL", symbol)
+                new_state.pop(symbol, None)  # signal gone -> next appearance counts as new
                 continue
 
             btc_gate_blocked = False
@@ -622,13 +658,20 @@ def scan_once():
                               symbol, final_signal, btc_trend)
                     final_signal = "NEUTRAL"
 
+            key = signal_key(final_signal, results)
+            if state.get(symbol) == key:
+                log.info("%s: SKIP Telegram - same signal already sent (%s)", symbol, key)
+                continue
+
             message = build_message(symbol, final_signal, results, buy_tfs, sell_tfs, btc_gate_blocked)
             send_telegram(message)
+            new_state[symbol] = key
             log.info("%s: Telegram sent - final signal %s", symbol, final_signal)
 
         except Exception as exc:
             log.exception("Error scanning %s: %s", symbol, exc)
 
+    save_state(new_state)
     log.info("Scan completed at %s", datetime.now(timezone.utc).isoformat())
 
 
