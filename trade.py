@@ -77,6 +77,8 @@ CHOCH_LOOKBACK = 2      # the break must happen within the last N closed candles
 VOLUME_MA_PERIOD = 20
 REVERSAL_VOL_MULT = 1.5
 WICK_RATIO = 1.5        # hammer: long wick >= WICK_RATIO * body
+MOMENTUM_BODY_PCT = 0.6 # strong candle: body >= 60% of its full range
+REVERSAL_CANDLE_LOOKBACK = 3  # look for the candle+volume in the last N closed candles
 
 # --- Bonus: Tenkan/Kijun cross ---
 TENKAN, KIJUN = 9, 26
@@ -338,18 +340,22 @@ def candle_pattern(df, k, direction):
             return "hammer"
         if c > o and pc < po and c >= po and o <= pc:
             return "bullish engulfing"
+        if c > o and abs(c - o) >= MOMENTUM_BODY_PCT * rng:
+            return "strong bullish candle"
     else:
         if upper >= WICK_RATIO * body and c <= h - 0.5 * rng:
             return "shooting star"
         if c < o and pc > po and c <= po and o >= pc:
             return "bearish engulfing"
+        if c < o and abs(c - o) >= MOMENTUM_BODY_PCT * rng:
+            return "strong bearish candle"
     return None
 
 
 def reversal_confirmation(df, i, direction):
-    """Returns (pattern_name_or_None, volume_ok). Checks the last 2 closed candles."""
+    """Returns (pattern_name_or_None, volume_ok). Checks the last REVERSAL_CANDLE_LOOKBACK closed candles."""
     seen = None
-    for k in (i, i - 1):
+    for k in range(i, i - REVERSAL_CANDLE_LOOKBACK, -1):
         name = candle_pattern(df, k, direction)
         if not name:
             continue
