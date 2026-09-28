@@ -5,12 +5,25 @@ import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
+import numpy as np
 import requests
 from requests.adapters import HTTPAdapter, Retry
 import pandas as pd
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# =========================================================
+# Reversal scanner: detects EARLY trend changes
+#   BUY  = downtrend exhausted -> possible bottom
+#   SELL = uptrend exhausted   -> possible top
+#
+# A signal needs ALL of:
+#   1) Extreme zone      : Bollinger band touch OR RSI oversold/overbought
+#   2) Reversal trigger  : RSI divergence OR market-structure break (CHoCH)
+#   3) Reversal candle   : hammer / engulfing WITH a volume spike
+# Bonus (shown in the message, not required): Tenkan/Kijun cross.
+# =========================================================
 
 # =========================
 # CONFIG
@@ -19,117 +32,66 @@ KUCOIN_URL = "https://api.kucoin.com/api/ua/v2/market/kline"
 TELEGRAM_URL = "https://api.telegram.org/bot{}/sendMessage"
 
 SYMBOLS = [
-    "BTC-USDT",
-    "ETH-USDT",
-    "BNB-USDT",
-    "XRP-USDT",
-    "SOL-USDT",
-    "TRX-USDT",
-    "ZEC-USDT",
-    "HYPE-USDT",
-    "DOGE-USDT",
-    "LINK-USDT",
-    "XMR-USDT",
-    "ADA-USDT",
-    "XLM-USDT",
-    "BCH-USDT",
-    "NEAR-USDT",
-    "UNI-USDT",
-    "LTC-USDT",
-    "CC-USDT",
-    "AVAX-USDT",
-    "SUI-USDT",
-    "HBAR-USDT",
-    "TAO-USDT",
-    "SHIB-USDT",
-    "CRO-USDT",
-    "ENA-USDT",
-    "ONDO-USDT",
-    "AAVE-USDT",
-    "MNT-USDT",
-    "DOT-USDT",
-    "PUMP-USDT",
-    "ASTER-USDT",
-    "WLD-USDT",
-    "WLFI-USDT",
-    "SKY-USDT",
-    "PEPE-USDT",
-    "ICP-USDT",
-    "POL-USDT",
-    "DASH-USDT",
-    "WIF-USDT",
-    "TRUMP-USDT",
-    "VIRTUAL-USDT",
-    "PENGU-USDT",
-    "INJ-USDT",
-    "KAS-USDT",
-    "FIL-USDT",
-    "ATOM-USDT",
-    "APE-USDT",
-    "TIA-USDT",
-    "BONK-USDT",
-    "ZRO-USDT",
-    "OP-USDT",
-    "SEI-USDT",
-    "ARB-USDT",
-    "FARTCOIN-USDT",
-    "W-USDT",
-    "AKT-USDT",
-    "STORJ-USDT",
-    "APT-USDT",
-    "ETC-USDT",
-    "ALGO-USDT",
-    "VET-USDT",
-    "STX-USDT",
-    "RENDER-USDT",
-    "LDO-USDT",
-    "FET-USDT",
-    "PENDLE-USDT",
-    "CRV-USDT",
+    "BTC-USDT", "ETH-USDT", "BNB-USDT", "XRP-USDT", "SOL-USDT", "TRX-USDT",
+    "ZEC-USDT", "HYPE-USDT", "DOGE-USDT", "LINK-USDT", "XMR-USDT", "ADA-USDT",
+    "XLM-USDT", "BCH-USDT", "NEAR-USDT", "UNI-USDT", "LTC-USDT", "CC-USDT",
+    "AVAX-USDT", "SUI-USDT", "HBAR-USDT", "TAO-USDT", "SHIB-USDT", "CRO-USDT",
+    "ENA-USDT", "ONDO-USDT", "AAVE-USDT", "MNT-USDT", "DOT-USDT", "PUMP-USDT",
+    "ASTER-USDT", "WLD-USDT", "WLFI-USDT", "SKY-USDT", "PEPE-USDT", "ICP-USDT",
+    "POL-USDT", "DASH-USDT", "WIF-USDT", "TRUMP-USDT", "VIRTUAL-USDT",
+    "PENGU-USDT", "INJ-USDT", "KAS-USDT", "FIL-USDT", "ATOM-USDT", "APE-USDT",
+    "TIA-USDT", "BONK-USDT", "ZRO-USDT", "OP-USDT", "SEI-USDT", "ARB-USDT",
+    "FARTCOIN-USDT", "W-USDT", "AKT-USDT", "STORJ-USDT", "APT-USDT", "ETC-USDT",
+    "ALGO-USDT", "VET-USDT", "STX-USDT", "RENDER-USDT", "LDO-USDT", "FET-USDT",
+    "PENDLE-USDT", "CRV-USDT",
 ]
 
+# Reversals are more reliable on higher timeframes. Add "15m": "15min" if you want.
 TIMEFRAMES = {
-    "15m": "15min",
     "1h": "1hour",
     "4h": "4hour",
     "1D": "1day",
 }
-
-# --- Ichimoku ---
-TENKAN, KIJUN, SENKOU_B, DISPLACEMENT = 9, 26, 52, 26
-MIN_CONFIRMATIONS = 4  # Require all 4 Ichimoku confirmations
 MIN_TF_CONFIRMATIONS = 1
 
-# --- Extra filters (all applied per-timeframe unless noted) ---
-KUMO_THICKNESS_MIN_PCT = 0.30
-BREAKOUT_MARGIN_PCT = 0.15
-
-ADX_PERIOD = 14
-ADX_MIN = 20
-
-EMA_PERIOD = 200
-
+# --- 1) Extreme zone ---
 RSI_PERIOD = 14
-
+RSI_OS = 30            # oversold  (BUY setups)
+RSI_OB = 70            # overbought (SELL setups)
 BB_PERIOD = 20
 BB_STD = 2
-BB_WIDTH_MIN_PCT = 1.0
+EXTREME_LOOKBACK = 12  # the extreme must have happened within the last N candles
 
+# --- 2a) RSI divergence ---
+PIVOT_WINDOW = 3        # candles on each side to confirm a swing pivot
+DIV_MIN_GAP = 5         # min candles between the two pivots
+DIV_MAX_GAP = 60        # max candles between the two pivots
+DIV_MAX_AGE = 15        # newest pivot must be at most N candles old
+RSI_DIV_MIN_DIFF = 1.0  # RSI must differ by at least this between the pivots
+RSI_DIV_ZONE_BULL = 40  # first pivot's RSI must be <= this (bullish divergence)
+RSI_DIV_ZONE_BEAR = 60  # first pivot's RSI must be >= this (bearish divergence)
+
+# --- 2b) Structure break (CHoCH) ---
+CHOCH_LOOKBACK = 2      # the break must happen within the last N closed candles
+
+# --- 3) Reversal candle + volume ---
 VOLUME_MA_PERIOD = 20
-VOLUME_SPIKE_MULT = 1.2
+REVERSAL_VOL_MULT = 1.5
+WICK_RATIO = 1.5        # hammer: long wick >= WICK_RATIO * body
 
-SWING_WINDOW = 5
-STRUCTURE_MARGIN_PCT = 0.25
+# --- Bonus: Tenkan/Kijun cross ---
+TENKAN, KIJUN = 9, 26
+TK_LOOKBACK = 3
 
-# BTC correlation is a global gate applied to the final combined signal,
-# using BTC's own 4h Ichimoku trend. Skipped for BTC itself.
+# --- BTC context (warning by default; set BTC_GATE_BLOCKS=1 to block alt signals) ---
 BTC_SYMBOL = "BTC-USDT"
-BTC_CORRELATION_TF = "4hour"
+BTC_CONTEXT_TF = "4hour"
+BTC_EMA_PERIOD = 50
+BTC_GATE_BLOCKS = os.getenv("BTC_GATE_BLOCKS", "0") == "1"
 
-# Need enough closed candles for EMA200 warmup + Ichimoku displacement on
-# every timeframe, including 1-day (200 daily candles = ~200 days back).
 CANDLE_LIMIT = 300
-CANDLE_FETCH_BUFFER = 60  # extra candles requested beyond CANDLE_LIMIT
+CANDLE_FETCH_BUFFER = 60
+MIN_CANDLES = 100
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 MAX_WORKERS = 6
@@ -139,7 +101,7 @@ logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
-log = logging.getLogger("ichimoku-bot")
+log = logging.getLogger("reversal-bot")
 
 
 # =========================
@@ -207,10 +169,11 @@ def fetch_klines(symbol, interval):
     df["timestamp"] = pd.to_datetime(pd.to_numeric(df["timestamp"]), unit="s", utc=True)
     df = df.dropna().drop_duplicates(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
 
+    # keep CLOSED candles only
     now_ts = pd.Timestamp.now(tz="UTC")
     df = df[(df["timestamp"] + pd.Timedelta(seconds=seconds)) <= now_ts].copy()
 
-    if len(df) < SENKOU_B + DISPLACEMENT + 5:
+    if len(df) < MIN_CANDLES:
         raise RuntimeError(f"Not enough CLOSED candles for {symbol} {interval}: {len(df)}")
 
     return df.tail(CANDLE_LIMIT).reset_index(drop=True)
@@ -219,258 +182,262 @@ def fetch_klines(symbol, interval):
 # =========================
 # INDICATORS
 # =========================
-def add_ichimoku(df):
-    high, low, close = df["high"], df["low"], df["close"]
-    df["tenkan"] = (high.rolling(TENKAN).max() + low.rolling(TENKAN).min()) / 2
-    df["kijun"] = (high.rolling(KIJUN).max() + low.rolling(KIJUN).min()) / 2
-    df["span_a"] = (df["tenkan"] + df["kijun"]) / 2
-    df["span_b"] = (high.rolling(SENKOU_B).max() + low.rolling(SENKOU_B).min()) / 2
-    df["cloud_top"] = df[["span_a", "span_b"]].max(axis=1)
-    df["cloud_bottom"] = df[["span_a", "span_b"]].min(axis=1)
-    df["kumo_thickness_pct"] = (df["cloud_top"] - df["cloud_bottom"]) / close * 100
-    return df
-
-
-def add_adx(df, period=ADX_PERIOD):
-    high, low, close = df["high"], df["low"], df["close"]
-    prev_close, prev_high, prev_low = close.shift(1), high.shift(1), low.shift(1)
-    tr = pd.concat(
-        [high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1
-    ).max(axis=1)
-    up_move, down_move = high - prev_high, prev_low - low
-    plus_dm = pd.Series(0.0, index=df.index)
-    minus_dm = pd.Series(0.0, index=df.index)
-    plus_dm[(up_move > down_move) & (up_move > 0)] = up_move
-    minus_dm[(down_move > up_move) & (down_move > 0)] = down_move
-    atr = tr.ewm(alpha=1 / period, adjust=False).mean()
-    plus_di = 100 * plus_dm.ewm(alpha=1 / period, adjust=False).mean() / atr
-    minus_di = 100 * minus_dm.ewm(alpha=1 / period, adjust=False).mean() / atr
-    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di)
-    df["adx"] = dx.ewm(alpha=1 / period, adjust=False).mean()
-    return df
-
-
-def add_ema(df, period=EMA_PERIOD):
-    df["ema"] = df["close"].ewm(span=period, adjust=False).mean()
-    return df
-
-
 def add_rsi(df, period=RSI_PERIOD):
     delta = df["close"].diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
     avg_gain = gain.ewm(alpha=1 / period, adjust=False).mean()
     avg_loss = loss.ewm(alpha=1 / period, adjust=False).mean()
-    rs = avg_gain / avg_loss
+    rs = avg_gain / avg_loss.replace(0, np.nan)
     df["rsi"] = 100 - (100 / (1 + rs))
+    df["rsi"] = df["rsi"].fillna(100.0).where(avg_loss != 0, 100.0)
     return df
 
 
 def add_bollinger(df, period=BB_PERIOD, n_std=BB_STD):
     sma = df["close"].rolling(period).mean()
     std = df["close"].rolling(period).std()
-    df["bb_width_pct"] = (2 * n_std * std) / sma * 100
+    df["bb_upper"] = sma + n_std * std
+    df["bb_lower"] = sma - n_std * std
     return df
 
 
-def add_volume_features(df, period=VOLUME_MA_PERIOD):
+def add_volume_ma(df, period=VOLUME_MA_PERIOD):
     df["volume_ma"] = df["volume"].rolling(period).mean()
-    direction = df["close"].diff().apply(lambda x: 1 if x > 0 else (-1 if x < 0 else 0))
-    df["obv"] = (direction * df["volume"]).cumsum()
-    df["obv_slope"] = df["obv"].diff(5)
     return df
 
 
-def add_swing_structure(df, window=SWING_WINDOW):
+def add_tk(df):
+    high, low = df["high"], df["low"]
+    df["tenkan"] = (high.rolling(TENKAN).max() + low.rolling(TENKAN).min()) / 2
+    df["kijun"] = (high.rolling(KIJUN).max() + low.rolling(KIJUN).min()) / 2
+    return df
+
+
+def add_swing_structure(df, window=PIVOT_WINDOW):
+    """Last CONFIRMED swing high/low (known only `window` candles after the pivot)."""
     is_high = df["high"] == df["high"].rolling(2 * window + 1, center=True).max()
     is_low = df["low"] == df["low"].rolling(2 * window + 1, center=True).min()
-    confirmed_high = is_high.shift(window).fillna(False)
-    confirmed_low = is_low.shift(window).fillna(False)
+    confirmed_high = is_high.shift(window, fill_value=False)
+    confirmed_low = is_low.shift(window, fill_value=False)
     df["last_swing_high"] = df["high"].shift(window).where(confirmed_high).ffill()
     df["last_swing_low"] = df["low"].shift(window).where(confirmed_low).ffill()
     return df
 
 
 def build_indicators(df):
-    df = add_ichimoku(df)
-    df = add_adx(df)
-    df = add_ema(df)
     df = add_rsi(df)
     df = add_bollinger(df)
-    df = add_volume_features(df)
+    df = add_volume_ma(df)
+    df = add_tk(df)
     df = add_swing_structure(df)
     return df
 
 
 # =========================
-# SIGNAL LOGIC (per timeframe)
+# REVERSAL BUILDING BLOCKS
+# direction: +1 = looking for a bottom (BUY), -1 = looking for a top (SELL)
 # =========================
-def compute_confirmations(df, i):
-    """
-    Pure Ichimoku confirmations only (4 checks). This runs FIRST and decides
-    whether there is a candidate BUY/SELL at all. RSI is deliberately NOT
-    part of this step - it is only checked afterwards, in
-    passes_extra_filters(), and only for a symbol/timeframe that already has
-    a full Ichimoku confirmation.
-    """
-    close_s, span_a_s, span_b_s = df["close"], df["span_a"], df["span_b"]
-    row = df.iloc[i]
-    bull, bear = [], []
-
-    if row["close"] > row["cloud_top"]:
-        bull.append("Price > Kumo")
-    elif row["close"] < row["cloud_bottom"]:
-        bear.append("Price < Kumo")
-
-    if row["tenkan"] > row["kijun"]:
-        bull.append("Tenkan > Kijun")
-    elif row["tenkan"] < row["kijun"]:
-        bear.append("Tenkan < Kijun")
-
-    if row["span_a"] > row["span_b"]:
-        bull.append("Bullish Kumo")
-    elif row["span_a"] < row["span_b"]:
-        bear.append("Bearish Kumo")
-
-    if i >= DISPLACEMENT + SENKOU_B:
-        chikou = close_s.iloc[i - DISPLACEMENT]
-        hist_price = close_s.iloc[i - 2 * DISPLACEMENT]
-        hist_a = span_a_s.iloc[i - 2 * DISPLACEMENT]
-        hist_b = span_b_s.iloc[i - 2 * DISPLACEMENT]
-        if not any(pd.isna(v) for v in (chikou, hist_price, hist_a, hist_b)):
-            top, bottom = max(hist_a, hist_b), min(hist_a, hist_b)
-            if chikou > hist_price and chikou > top:
-                bull.append("Chikou bullish")
-            elif chikou < hist_price and chikou < bottom:
-                bear.append("Chikou bearish")
-
-    return bull, bear
-
-
-def passes_extra_filters(sig, row):
-    """
-    All the non-Ichimoku filters. Only called once Ichimoku has already
-    fully confirmed a BUY (sig=1) or SELL (sig=-1) candidate.
-    Returns (passed, list_of_failed_filter_names).
-    """
-    failed = []
-
-    if row["kumo_thickness_pct"] < KUMO_THICKNESS_MIN_PCT:
-        failed.append("thin_kumo")
-
-    margin = ((row["close"] - row["cloud_top"]) if sig == 1
-              else (row["cloud_bottom"] - row["close"])) / row["close"] * 100
-    if margin < BREAKOUT_MARGIN_PCT:
-        failed.append("weak_breakout")
-
-    if pd.isna(row.get("adx")) or row["adx"] < ADX_MIN:
-        failed.append("low_adx")
-
-    if pd.isna(row.get("ema")):
-        failed.append("ema_warmup")
-    elif (sig == 1 and row["close"] <= row["ema"]) or (sig == -1 and row["close"] >= row["ema"]):
-        failed.append("against_ema200")
-
-    # --- RSI check: runs only after Ichimoku is fully confirmed.
-    # Midline rule: RSI < 50 confirms BUY, RSI > 50 confirms SELL. ---
-    # if pd.isna(row.get("rsi")):
-        # failed.append("rsi_warmup")
-    # elif sig == 1 and row["rsi"] >= 50:
-        # failed.append("rsi_not_bullish")
-    # elif sig == -1 and row["rsi"] <= 50:
-        # failed.append("rsi_not_bearish")
-
-    if pd.isna(row.get("bb_width_pct")) or row["bb_width_pct"] < BB_WIDTH_MIN_PCT:
-        failed.append("low_volatility")
-
-    if pd.isna(row.get("volume_ma")) or row["volume_ma"] == 0:
-        failed.append("volume_warmup")
+def extreme_zone(df, i, direction):
+    """Returns a list of reasons if price recently hit an extreme, else []."""
+    sl = slice(i - EXTREME_LOOKBACK + 1, i + 1)
+    reasons = []
+    if direction == 1:
+        if (df["low"].iloc[sl] <= df["bb_lower"].iloc[sl]).any():
+            reasons.append("Bollinger lower band touch")
+        rsi_min = df["rsi"].iloc[sl].min()
+        if rsi_min <= RSI_OS:
+            reasons.append(f"RSI oversold ({rsi_min:.0f})")
     else:
-        vol_ok = row["volume"] >= VOLUME_SPIKE_MULT * row["volume_ma"]
-        obv_ok = row["obv_slope"] > 0 if sig == 1 else row["obv_slope"] < 0
-        if not (vol_ok and obv_ok):
-            failed.append("no_volume_confirmation")
-
-    if sig == 1 and not pd.isna(row.get("last_swing_high")) and row["close"] < row["last_swing_high"]:
-        if (row["last_swing_high"] - row["close"]) / row["close"] * 100 > STRUCTURE_MARGIN_PCT:
-            failed.append("below_resistance")
-    if sig == -1 and not pd.isna(row.get("last_swing_low")) and row["close"] > row["last_swing_low"]:
-        if (row["close"] - row["last_swing_low"]) / row["close"] * 100 > STRUCTURE_MARGIN_PCT:
-            failed.append("above_support")
-
-    return len(failed) == 0, failed
+        if (df["high"].iloc[sl] >= df["bb_upper"].iloc[sl]).any():
+            reasons.append("Bollinger upper band touch")
+        rsi_max = df["rsi"].iloc[sl].max()
+        if rsi_max >= RSI_OB:
+            reasons.append(f"RSI overbought ({rsi_max:.0f})")
+    return reasons
 
 
+def find_pivots(values, window, kind, last_index):
+    """Confirmed pivot indices: values[j] is the min ('low') / max ('high') of [j-w, j+w]."""
+    out = []
+    for j in range(window, last_index - window + 1):
+        seg = values[j - window: j + window + 1]
+        if np.isnan(seg).any():
+            continue
+        v = values[j]
+        if (kind == "low" and v <= seg.min()) or (kind == "high" and v >= seg.max()):
+            out.append(j)
+    return out
+
+
+def detect_divergence(df, i, direction):
+    """
+    Bullish: price makes a LOWER low while RSI makes a HIGHER low.
+    Bearish: price makes a HIGHER high while RSI makes a LOWER high.
+    """
+    rsi = df["rsi"].to_numpy()
+    if direction == 1:
+        price = df["low"].to_numpy()
+        piv = find_pivots(price, PIVOT_WINDOW, "low", i)
+    else:
+        price = df["high"].to_numpy()
+        piv = find_pivots(price, PIVOT_WINDOW, "high", i)
+
+    if len(piv) < 2:
+        return False
+    p2 = piv[-1]
+    if i - p2 > DIV_MAX_AGE:
+        return False
+
+    for p1 in reversed(piv[:-1]):
+        gap = p2 - p1
+        if gap < DIV_MIN_GAP:
+            continue
+        if gap > DIV_MAX_GAP:
+            return False
+        if direction == 1:
+            return bool(price[p2] < price[p1]
+                        and rsi[p2] > rsi[p1] + RSI_DIV_MIN_DIFF
+                        and rsi[p1] <= RSI_DIV_ZONE_BULL)
+        return bool(price[p2] > price[p1]
+                    and rsi[p2] < rsi[p1] - RSI_DIV_MIN_DIFF
+                    and rsi[p1] >= RSI_DIV_ZONE_BEAR)
+    return False
+
+
+def detect_choch(df, i, direction):
+    """
+    Change of character: price closes back through the last confirmed swing
+    high (bottom) / swing low (top) that had been holding the old trend.
+    The break must be fresh (within CHOCH_LOOKBACK closed candles).
+    """
+    close = df["close"].to_numpy()
+    lvl = df["last_swing_high" if direction == 1 else "last_swing_low"].to_numpy()
+    for k in range(i, i - CHOCH_LOOKBACK, -1):
+        if k < 1 or np.isnan(lvl[k]) or np.isnan(lvl[k - 1]):
+            continue
+        if direction == 1 and close[k] > lvl[k] and close[k - 1] <= lvl[k - 1]:
+            return True
+        if direction == -1 and close[k] < lvl[k] and close[k - 1] >= lvl[k - 1]:
+            return True
+    return False
+
+
+def candle_pattern(df, k, direction):
+    o, c = df["open"].iloc[k], df["close"].iloc[k]
+    h, l = df["high"].iloc[k], df["low"].iloc[k]
+    rng = h - l
+    if rng <= 0:
+        return None
+    body = max(abs(c - o), rng * 0.02)
+    upper = h - max(o, c)
+    lower = min(o, c) - l
+    po, pc = df["open"].iloc[k - 1], df["close"].iloc[k - 1]
+
+    if direction == 1:
+        if lower >= WICK_RATIO * body and c >= l + 0.5 * rng:
+            return "hammer"
+        if c > o and pc < po and c >= po and o <= pc:
+            return "bullish engulfing"
+    else:
+        if upper >= WICK_RATIO * body and c <= h - 0.5 * rng:
+            return "shooting star"
+        if c < o and pc > po and c <= po and o >= pc:
+            return "bearish engulfing"
+    return None
+
+
+def reversal_confirmation(df, i, direction):
+    """Returns (pattern_name_or_None, volume_ok). Checks the last 2 closed candles."""
+    seen = None
+    for k in (i, i - 1):
+        name = candle_pattern(df, k, direction)
+        if not name:
+            continue
+        seen = seen or name
+        vma = df["volume_ma"].iloc[k]
+        if pd.notna(vma) and vma > 0 and df["volume"].iloc[k] >= REVERSAL_VOL_MULT * vma:
+            return name, True
+    return seen, False
+
+
+def tk_cross(df, i, direction):
+    t, kj = df["tenkan"].to_numpy(), df["kijun"].to_numpy()
+    for k in range(i, i - TK_LOOKBACK, -1):
+        if k < 1 or np.isnan(t[k]) or np.isnan(kj[k]) or np.isnan(t[k - 1]) or np.isnan(kj[k - 1]):
+            continue
+        if direction == 1 and t[k] > kj[k] and t[k - 1] <= kj[k - 1]:
+            return True
+        if direction == -1 and t[k] < kj[k] and t[k - 1] >= kj[k - 1]:
+            return True
+    return False
+
+
+# =========================
+# PER-TIMEFRAME ANALYSIS
+# =========================
 def analyze_timeframe(symbol, tf, df):
     df = build_indicators(df)
     i = len(df) - 1
     row = df.iloc[i]
+    price = float(row["close"])
 
-    if any(pd.isna(row.get(c)) for c in ["tenkan", "kijun", "span_a", "span_b"]):
-        log.info("%s %s: SKIP - Ichimoku still warming up (not enough closed candles yet)", symbol, tf)
-        return {"signal": "NEUTRAL", "confirmations": [], "price": float(row["close"])}
+    needed = ["rsi", "bb_lower", "bb_upper", "volume_ma", "tenkan", "kijun"]
+    if any(pd.isna(row[c]) for c in needed):
+        log.info("%s %s: SKIP - indicators still warming up", symbol, tf)
+        return {"signal": "NEUTRAL", "watch": None, "reasons": [], "price": price}
 
-    # --- Stage 1: Ichimoku vote count ---
-    bull, bear = compute_confirmations(df, i)
-    bull_count, bear_count = len(bull), len(bear)
+    watch = None
+    for direction, name in ((1, "BUY"), (-1, "SELL")):
+        extreme = extreme_zone(df, i, direction)
+        if not extreme:
+            continue
 
-    raw_signal, signal, confirmations = "NEUTRAL", "NEUTRAL", []
-    if bull_count >= MIN_CONFIRMATIONS and bull_count > bear_count:
-        raw_signal = signal = "BUY"
-        confirmations = bull
-    elif bear_count >= MIN_CONFIRMATIONS and bear_count > bull_count:
-        raw_signal = signal = "SELL"
-        confirmations = bear
+        div = detect_divergence(df, i, direction)
+        choch = detect_choch(df, i, direction)
+        if not (div or choch):
+            log.info("%s %s: %s watch - extreme (%s) but no divergence / structure break yet",
+                     symbol, tf, name, ", ".join(extreme))
+            watch = watch or {"side": name, "stage": "extreme, waiting for divergence/CHoCH"}
+            continue
 
-    if raw_signal == "NEUTRAL":
-        log.info(
-            "%s %s: NEUTRAL - Ichimoku not aligned (bull %d/%d: %s | bear %d/%d: %s, need >=%d one-sided)",
-            symbol, tf, bull_count, MIN_CONFIRMATIONS, bull or "-",
-            bear_count, MIN_CONFIRMATIONS, bear or "-", MIN_CONFIRMATIONS,
-        )
-        return {"signal": "NEUTRAL", "raw_signal": "NEUTRAL", "confirmations": [],
-                "filters_failed": [], "price": float(row["close"])}
+        pattern, vol_ok = reversal_confirmation(df, i, direction)
+        if not (pattern and vol_ok):
+            why = "no reversal candle" if not pattern else f"{pattern} without volume spike"
+            log.info("%s %s: %s watch - trigger found but %s", symbol, tf, name, why)
+            watch = {"side": name, "stage": "trigger found, waiting for candle+volume"}
+            continue
 
-    log.info("%s %s: Ichimoku confirmed %s (%s) -> checking extra filters",
-              symbol, tf, raw_signal, ", ".join(confirmations))
+        reasons = list(extreme)
+        if div:
+            reasons.append("RSI divergence")
+        if choch:
+            reasons.append("structure break (CHoCH)")
+        reasons.append(f"{pattern} + volume spike")
+        if tk_cross(df, i, direction):
+            reasons.append("Tenkan/Kijun cross (bonus)")
 
-    # --- Stage 2: extra filters, only reached once Ichimoku fully agrees ---
-    sig_num = 1 if raw_signal == "BUY" else -1
-    passed, filters_failed = passes_extra_filters(sig_num, row)
+        span = EXTREME_LOOKBACK + PIVOT_WINDOW
+        recent = df.iloc[max(0, i - span + 1): i + 1]
+        invalidation = float(recent["low"].min() if direction == 1 else recent["high"].max())
 
-    if passed:
-        log.info("%s %s: PASSED all extra filters -> final signal %s", symbol, tf, raw_signal)
-        signal = raw_signal
-    else:
-        reasons = ", ".join(FILTER_LABELS.get(f, f) for f in filters_failed)
-        log.info("%s %s: BLOCKED - %s failed [%s]", symbol, tf, raw_signal, reasons)
-        signal, confirmations = "NEUTRAL", []
+        log.info("%s %s: %s REVERSAL SIGNAL (%s)", symbol, tf, name, " + ".join(reasons))
+        return {"signal": name, "watch": None, "reasons": reasons,
+                "price": price, "invalidation": invalidation}
 
-    return {
-        "signal": signal,
-        "raw_signal": raw_signal,  # what Ichimoku alone said, before extra filters
-        "confirmations": confirmations,
-        "filters_failed": filters_failed,
-        "price": float(row["close"]),
-    }
+    if not watch:
+        log.info("%s %s: NEUTRAL - no extreme zone", symbol, tf)
+    return {"signal": "NEUTRAL", "watch": watch, "reasons": [], "price": price}
 
 
 # =========================
-# BTC CORRELATION (global gate)
+# BTC CONTEXT
 # =========================
-def get_btc_trend_4h():
-    """Returns 1 (bullish), -1 (bearish), or 0 (neutral) for BTC's 4h Ichimoku trend."""
-    df = fetch_klines(BTC_SYMBOL, BTC_CORRELATION_TF)
-    df = add_ichimoku(df)
-    i = len(df) - 1
-    row = df.iloc[i]
-    if any(pd.isna(row.get(c)) for c in ["tenkan", "kijun", "cloud_top", "cloud_bottom"]):
-        return 0
-    if row["close"] > row["cloud_top"] and row["tenkan"] > row["kijun"]:
-        return 1
-    if row["close"] < row["cloud_bottom"] and row["tenkan"] < row["kijun"]:
-        return -1
-    return 0
+def get_btc_context():
+    """+1 if BTC 4h closes above its EMA, -1 if below."""
+    df = fetch_klines(BTC_SYMBOL, BTC_CONTEXT_TF)
+    ema = df["close"].ewm(span=BTC_EMA_PERIOD, adjust=False).mean()
+    return 1 if df["close"].iloc[-1] > ema.iloc[-1] else -1
 
 
 # =========================
@@ -485,8 +452,12 @@ def analyze_symbol(symbol):
         }
         for future in as_completed(futures):
             label = futures[future]
-            df = future.result()
-            results[label] = analyze_timeframe(symbol, label, df)
+            try:
+                df = future.result()
+                results[label] = analyze_timeframe(symbol, label, df)
+            except Exception as exc:
+                log.warning("%s %s: skipped (%s)", symbol, label, exc)
+                results[label] = {"signal": "NEUTRAL", "watch": None, "reasons": [], "price": None}
 
     buy_tfs = [tf for tf in TIMEFRAMES if results[tf]["signal"] == "BUY"]
     sell_tfs = [tf for tf in TIMEFRAMES if results[tf]["signal"] == "SELL"]
@@ -524,66 +495,47 @@ def fmt_price(price):
     return f"{price:.8f}"
 
 
-FILTER_LABELS = {
-    "thin_kumo": "thin cloud",
-    "weak_breakout": "weak breakout",
-    "low_adx": "no trend (ADX)",
-    "against_ema200": "against EMA200",
-    "ema_warmup": "EMA warmup",
-    "rsi_not_bullish": "RSI above 50",
-    "rsi_not_bearish": "RSI below 50",
-    "rsi_warmup": "RSI warmup",
-    "low_volatility": "low volatility",
-    "no_volume_confirmation": "no volume confirm",
-    "volume_warmup": "volume warmup",
-    "below_resistance": "below resistance",
-    "above_support": "above support",
-}
-
-
 def tf_line(tf, r):
-    """One compact line per timeframe: mark + label, and if Ichimoku wanted a
-    signal but an extra filter blocked it, show the top reason why."""
     s = r["signal"]
-    mark = "🟢" if s == "BUY" else "🔴" if s == "SELL" else "⚪"
-
-    if s == "NEUTRAL" and r.get("raw_signal") in ("BUY", "SELL") and r.get("filters_failed"):
-        reasons = ", ".join(FILTER_LABELS.get(f, f) for f in r["filters_failed"][:2])
-        return f"{mark} {tf}: blocked ({reasons})"
-
-    return f"{mark} {tf}: {s}"
+    if s in ("BUY", "SELL"):
+        return f"{'🟢' if s == 'BUY' else '🔴'} {tf}: {s}"
+    if r.get("watch"):
+        return f"👀 {tf}: watch {r['watch']['side']} ({r['watch']['stage']})"
+    return f"⚪ {tf}: no setup"
 
 
-def build_message(symbol, final_signal, results, buy_tfs, sell_tfs, btc_gate_blocked):
-    emoji = "🟢" if final_signal == "BUY" else "🔴" if final_signal == "SELL" else "⚪"
-    agreeing = buy_tfs if final_signal == "BUY" else sell_tfs if final_signal == "SELL" else []
+def build_message(symbol, final_signal, results, buy_tfs, sell_tfs, btc_trend):
+    is_buy = final_signal == "BUY"
+    emoji = "🟢" if is_buy else "🔴"
+    agreeing = buy_tfs if is_buy else sell_tfs
+    label = "possible BOTTOM (reversal up)" if is_buy else "possible TOP (reversal down)"
 
-    latest_price = results["15m"]["price"]
+    price = next((results[tf]["price"] for tf in TIMEFRAMES if results[tf]["price"]), None)
+    lines = [f"{emoji} {symbol} — {final_signal}: {label}"]
+    if price:
+        lines.append(f"{fmt_price(price)} USDT")
+    lines.append(f"{len(agreeing)}/{len(TIMEFRAMES)} timeframes: {', '.join(agreeing)}")
 
-    lines = [f"{emoji} {symbol} — {final_signal}", f"{fmt_price(latest_price)} USDT"]
-
-    if agreeing:
-        lines.append(f"{len(agreeing)}/{len(TIMEFRAMES)} timeframes agree: {', '.join(agreeing)}")
-    if btc_gate_blocked:
-        lines.append("⚠️ blocked — BTC 4h trend disagrees")
+    if symbol != BTC_SYMBOL and btc_trend is not None:
+        against = (is_buy and btc_trend < 0) or (not is_buy and btc_trend > 0)
+        state = "above EMA%d" % BTC_EMA_PERIOD if btc_trend > 0 else "below EMA%d" % BTC_EMA_PERIOD
+        lines.append(f"{'⚠️ ' if against else ''}BTC 4h {state}" + (" — against this signal" if against else ""))
 
     lines.append("")
     for tf in TIMEFRAMES:
         lines.append(tf_line(tf, results[tf]))
 
-    strong_tfs = [tf for tf in TIMEFRAMES if results[tf]["signal"] in ("BUY", "SELL")]
-    if strong_tfs:
-        lines.append("")
-        for tf in strong_tfs:
-            r = results[tf]
-            lines.append(f"{tf} confirmations: {' + '.join(r['confirmations'])}")
+    for tf in agreeing:
+        r = results[tf]
+        lines += ["", f"{tf}: {' + '.join(r['reasons'])}",
+                  f"{tf} invalidation: {fmt_price(r['invalidation'])}"]
 
-    lines += ["", "⚠️ Technical signal only — not financial advice."]
+    lines += ["", "⚠️ Early reversal signal — more false signals than trend-following. Not financial advice."]
     return "\n".join(lines)
 
 
 # =========================
-# SIGNAL STATE (dedupe: only send when the signal is new/changed)
+# SIGNAL STATE (dedupe while the same signal persists)
 # =========================
 def load_state():
     try:
@@ -605,11 +557,9 @@ def save_state(state):
         log.warning("Could not write %s (%s)", STATE_FILE, exc)
 
 
-def signal_key(final_signal, results):
-    """Fingerprint of what would be sent: final signal + which timeframes fired."""
-    fired = [f"{tf}={results[tf]['signal']}" for tf in TIMEFRAMES
-             if results[tf]["signal"] in ("BUY", "SELL")]
-    return f"{final_signal}|" + ",".join(fired)
+def signal_key(final_signal, buy_tfs, sell_tfs):
+    tfs = buy_tfs if final_signal == "BUY" else sell_tfs
+    return f"{final_signal}|{','.join(tfs)}"
 
 
 # =========================
@@ -619,10 +569,10 @@ def scan_once():
     log.info("Starting scan...")
 
     try:
-        btc_trend = get_btc_trend_4h()
-        log.info("BTC 4h trend gate: %s", btc_trend)
+        btc_trend = get_btc_context()
+        log.info("BTC 4h context: %s", "bullish" if btc_trend > 0 else "bearish")
     except Exception as exc:
-        log.warning("Could not fetch BTC trend for correlation filter (%s); gate disabled this scan.", exc)
+        log.warning("Could not fetch BTC context (%s).", exc)
         btc_trend = None
 
     state = load_state()
@@ -633,40 +583,24 @@ def scan_once():
             final_signal, results, buy_tfs, sell_tfs = analyze_symbol(symbol)
 
             if final_signal == "NEUTRAL":
-                log.info(
-                    "%s: NEUTRAL overall - only %d BUY tf(s) %s and %d SELL tf(s) %s, need >=%d agreeing one-sided",
-                    symbol, len(buy_tfs), buy_tfs or "-", len(sell_tfs), sell_tfs or "-", MIN_TF_CONFIRMATIONS,
-                )
-            else:
-                log.info("%s: %d/%d timeframes agree on %s (%s)",
-                          symbol, len(buy_tfs if final_signal == "BUY" else sell_tfs),
-                          len(TIMEFRAMES), final_signal,
-                          ", ".join(buy_tfs if final_signal == "BUY" else sell_tfs))
-
-            has_any_signal = any(results[tf]["signal"] in ("BUY", "SELL") for tf in TIMEFRAMES)
-            if not has_any_signal:
-                log.info("%s: SKIP Telegram - every timeframe NEUTRAL", symbol)
-                new_state.pop(symbol, None)  # signal gone -> next appearance counts as new
+                log.info("%s: no reversal signal", symbol)
+                new_state.pop(symbol, None)  # signal gone -> next one counts as new
                 continue
 
-            btc_gate_blocked = False
-            if symbol != BTC_SYMBOL and btc_trend is not None and final_signal != "NEUTRAL":
-                sig_num = 1 if final_signal == "BUY" else -1
-                if (sig_num == 1 and btc_trend < 0) or (sig_num == -1 and btc_trend > 0):
-                    btc_gate_blocked = True
-                    log.info("%s: BLOCKED - %s disagrees with BTC 4h trend (%s)",
-                              symbol, final_signal, btc_trend)
-                    final_signal = "NEUTRAL"
+            if symbol != BTC_SYMBOL and btc_trend is not None and BTC_GATE_BLOCKS:
+                if (final_signal == "BUY" and btc_trend < 0) or (final_signal == "SELL" and btc_trend > 0):
+                    log.info("%s: BLOCKED - %s against BTC 4h context", symbol, final_signal)
+                    continue
 
-            key = signal_key(final_signal, results)
+            key = signal_key(final_signal, buy_tfs, sell_tfs)
             if state.get(symbol) == key:
                 log.info("%s: SKIP Telegram - same signal already sent (%s)", symbol, key)
                 continue
 
-            message = build_message(symbol, final_signal, results, buy_tfs, sell_tfs, btc_gate_blocked)
+            message = build_message(symbol, final_signal, results, buy_tfs, sell_tfs, btc_trend)
             send_telegram(message)
             new_state[symbol] = key
-            log.info("%s: Telegram sent - final signal %s", symbol, final_signal)
+            log.info("%s: Telegram sent - %s", symbol, final_signal)
 
         except Exception as exc:
             log.exception("Error scanning %s: %s", symbol, exc)
@@ -676,18 +610,12 @@ def scan_once():
 
 
 def main():
-    log.info("Ichimoku Telegram scanner started (full multi-indicator strategy).")
-    log.info("Symbols: %s", ", ".join(SYMBOLS))
-    log.info("Timeframes: %s", ", ".join(TIMEFRAMES))
+    log.info("Reversal scanner started.")
+    log.info("Symbols: %d | Timeframes: %s", len(SYMBOLS), ", ".join(TIMEFRAMES))
     log.info(
-        "Confirmations per timeframe: ALL 4 Ichimoku checks required first. "
-        "Only if Ichimoku fully confirms is the signal then checked against: "
-        "RSI vs 50 midline (BUY needs RSI<50, SELL needs RSI>50), kumo thickness, breakout margin, ADX>=%d, "
-        "EMA%d trend, Bollinger width>=%.1f%%, volume/OBV confirmation, "
-        "market structure. Plus a global BTC-4h-trend correlation gate for altcoins. "
-        "A symbol is skipped (no Telegram message) when every timeframe is NEUTRAL; "
-        "otherwise it's sent every scan regardless of whether the signal changed.",
-        ADX_MIN, EMA_PERIOD, BB_WIDTH_MIN_PCT,
+        "Signal = extreme zone (BB touch / RSI %d-%d) + trigger (RSI divergence or CHoCH) "
+        "+ reversal candle with volume >= %.1fx average. BTC gate blocks: %s",
+        RSI_OS, RSI_OB, REVERSAL_VOL_MULT, BTC_GATE_BLOCKS,
     )
     scan_once()
 
