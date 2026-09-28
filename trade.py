@@ -616,7 +616,8 @@ def scan_once():
 
 
 def main():
-    log.info("Reversal scanner started.")
+    log.info("Reversal scanner started. VERSION=r3 (candle lookback=%d, momentum candle >=%.0f%% body)",
+             REVERSAL_CANDLE_LOOKBACK, MOMENTUM_BODY_PCT * 100)
     log.info("Symbols: %d | Timeframes: %s", len(SYMBOLS), ", ".join(TIMEFRAMES))
     log.info(
         "Signal = extreme zone (BB touch / RSI %d-%d) + trigger (RSI divergence or CHoCH) "
