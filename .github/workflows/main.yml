@@ -19,8 +19,22 @@ jobs:
       - name: Install packages
         run: pip install -r requirements.txt
 
+      - name: Restore signal state
+        uses: actions/cache/restore@v4
+        with:
+          path: signal_state.json
+          key: signal-state-${{ github.run_id }}
+          restore-keys: signal-state-
+
       - name: Run bot
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python -u trade.py
+
+      - name: Save signal state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: signal_state.json
+          key: signal-state-${{ github.run_id }}
