@@ -46,11 +46,10 @@ SYMBOLS = [
     "PENDLE-USDT", "CRV-USDT",
 ]
 
-# Reversals are more reliable on higher timeframes. Add "15m": "15min" if you want.
+# Single timeframe: the signal is confirmed on this one only.
+# To switch, change the line below, e.g. {"4h": "4hour"} or {"15m": "15min"}.
 TIMEFRAMES = {
     "1h": "1hour",
-    "4h": "4hour",
-    "1D": "1day",
 }
 MIN_TF_CONFIRMATIONS = 1
 
@@ -514,7 +513,8 @@ def build_message(symbol, final_signal, results, buy_tfs, sell_tfs, btc_trend):
     lines = [f"{emoji} {symbol} — {final_signal}: {label}"]
     if price:
         lines.append(f"{fmt_price(price)} USDT")
-    lines.append(f"{len(agreeing)}/{len(TIMEFRAMES)} timeframes: {', '.join(agreeing)}")
+    if len(TIMEFRAMES) > 1:
+        lines.append(f"{len(agreeing)}/{len(TIMEFRAMES)} timeframes: {', '.join(agreeing)}")
 
     if symbol != BTC_SYMBOL and btc_trend is not None:
         against = (is_buy and btc_trend < 0) or (not is_buy and btc_trend > 0)
