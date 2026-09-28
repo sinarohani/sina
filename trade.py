@@ -162,13 +162,20 @@ def fetch_klines(symbol, interval):
         raise RuntimeError(f"No kline data for {symbol} {interval}")
 
     rows.sort(key=lambda x: int(x[0]))
+    # KuCoin UA v2 order is: time, open, HIGH, LOW, CLOSE, volume, turnover
+    # (the old v1 /market/candles order was open, close, high, low).
     df = pd.DataFrame(
-        rows, columns=["timestamp", "open", "close", "high", "low", "volume", "turnover"]
+        rows, columns=["timestamp", "open", "high", "low", "close", "volume", "turnover"]
     )
     for col in ["open", "close", "high", "low", "volume"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
     df["timestamp"] = pd.to_datetime(pd.to_numeric(df["timestamp"]), unit="s", utc=True)
     df = df.dropna().drop_duplicates(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+
+    # sanity check: catches a wrong column order instead of silently producing garbage
+    ok = (df["high"] >= df[["open", "close"]].max(axis=1)) & (df["low"] <= df[["open", "close"]].min(axis=1))
+    if len(df) and ok.mean() < 0.99:
+        raise RuntimeError(f"OHLC columns look wrong for {symbol} {interval} (valid candles: {ok.mean():.0%})")
 
     # keep CLOSED candles only
     now_ts = pd.Timestamp.now(tz="UTC")
@@ -616,7 +623,7 @@ def scan_once():
 
 
 def main():
-    log.info("Reversal scanner started. VERSION=r3 (candle lookback=%d, momentum candle >=%.0f%% body)",
+    log.info("Reversal scanner started. VERSION=r4 (candle lookback=%d, momentum candle >=%.0f%% body)",
              REVERSAL_CANDLE_LOOKBACK, MOMENTUM_BODY_PCT * 100)
     log.info("Symbols: %d | Timeframes: %s", len(SYMBOLS), ", ".join(TIMEFRAMES))
     log.info(
