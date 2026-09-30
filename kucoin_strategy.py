@@ -137,11 +137,12 @@ def get_current_open_interest(symbol):
     """
 
     data = api_get(
-        "/api/ua/v2/market/open-interest",
-        params={
-            "symbol": symbol,
-        },
-    )
+    "/api/ua/v2/market/ticker",
+    params={
+        "tradeType": "FUTURES",
+        "symbol": symbol,
+    },
+)
 
     if not data:
         return {}
