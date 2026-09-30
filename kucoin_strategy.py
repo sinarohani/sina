@@ -115,7 +115,7 @@ def get_ticker(symbol):
     """
 
     data = api_get(
-        "/api/ua/v2/market/ticker",
+        "/api/ua/v1/market/ticker",
         params={
             "symbol": symbol,
         },
