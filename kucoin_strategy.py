@@ -1,5 +1,5 @@
-import logging
 import time
+import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
@@ -8,9 +8,9 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 
-# =========================================================
+# ============================================================
 # CONFIG
-# =========================================================
+# ============================================================
 
 BASE_URL = "https://api.kucoin.com"
 
@@ -22,964 +22,820 @@ SYMBOLS = [
     "DOGEUSDTM",
 ]
 
-INTERVAL = "15min"
-
+KLINE_INTERVAL = "15min"
 OI_INTERVAL = "15min"
 
 KLINE_LIMIT = 100
+
+# مدت تاریخچه Funding که دریافت می‌کنیم
+FUNDING_HISTORY_HOURS = 24
 
 REQUEST_TIMEOUT = 15
 
 MAX_WORKERS = 5
 
 
-# =========================================================
+# ============================================================
 # LOGGING
-# =========================================================
+# ============================================================
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
 
-logger = logging.getLogger("kucoin_strategy")
+logger = logging.getLogger(__name__)
 
 
-# =========================================================
+# ============================================================
 # HTTP SESSION
-# =========================================================
+# ============================================================
 
-def create_session():
-    session = requests.Session()
+session = requests.Session()
 
-    retry = Retry(
-        total=3,
-        connect=3,
-        read=3,
-        backoff_factor=1,
-        status_forcelist=[
-            429,
-            500,
-            502,
-            503,
-            504,
-        ],
-        allowed_methods=["GET"],
-        raise_on_status=False,
-    )
+retry_strategy = Retry(
+    total=3,
+    connect=3,
+    read=3,
+    backoff_factor=1,
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods=["GET"],
+    raise_on_status=False,
+)
 
-    adapter = HTTPAdapter(
-        max_retries=retry,
-        pool_connections=20,
-        pool_maxsize=20,
-    )
+adapter = HTTPAdapter(
+    max_retries=retry_strategy,
+    pool_connections=20,
+    pool_maxsize=20,
+)
 
-    session.mount("https://", adapter)
-
-    session.headers.update(
-        {
-            "User-Agent": "KuCoin-Strategy-Bot/1.0",
-            "Accept": "application/json",
-        }
-    )
-
-    return session
+session.mount("https://", adapter)
+session.mount("http://", adapter)
 
 
-SESSION = create_session()
-
-
-# =========================================================
-# COMMON REQUEST
-# =========================================================
+# ============================================================
+# GENERAL API REQUEST
+# ============================================================
 
 def api_get(endpoint, params=None):
-    url = f"{BASE_URL}{endpoint}"
+    """
+    Send GET request to KuCoin public API.
+    """
 
-    response = SESSION.get(
+    url = BASE_URL + endpoint
+
+    response = session.get(
         url,
         params=params,
         timeout=REQUEST_TIMEOUT,
     )
 
-    response.raise_for_status()
-
-    data = response.json()
-
-    if data.get("code") != "200000":
-        raise RuntimeError(
-            f"KuCoin API error: {data}"
+    # اگر HTTP error بود، متن پاسخ KuCoin را هم نمایش بده
+    if response.status_code != 200:
+        logger.error(
+            "KuCoin HTTP %s | URL: %s | Response: %s",
+            response.status_code,
+            response.url,
+            response.text[:1000],
         )
 
-    return data.get("data")
+    response.raise_for_status()
+
+    payload = response.json()
+
+    if payload.get("code") != "200000":
+        raise RuntimeError(
+            f"KuCoin API error | code={payload.get('code')} "
+            f"| message={payload.get('msg') or payload.get('message')}"
+        )
+
+    return payload.get("data")
 
 
-# =========================================================
+# ============================================================
 # TICKER
-# =========================================================
+# ============================================================
 
 def get_ticker(symbol):
     """
-    دریافت قیمت و اطلاعات 24 ساعته Futures.
+    Get current futures ticker.
     """
 
     data = api_get(
         "/api/ua/v2/market/ticker",
-        {
-            "tradeType": "FUTURES",
+        params={
             "symbol": symbol,
         },
     )
 
-    if not data:
-        raise RuntimeError(
-            f"Ticker data is empty: {symbol}"
-        )
-
     if isinstance(data, list):
-        ticker = data[0]
-    elif isinstance(data, dict):
-        ticker = data
-    else:
-        raise RuntimeError(
-            f"Unexpected ticker response: {data}"
-        )
+        if not data:
+            return {}
 
-    return {
-        "price": float(
-            ticker.get("lastPrice", 0)
-        ),
-        "price_change": float(
-            ticker.get("priceChange", 0)
-        ),
-        "price_change_percent": float(
-            ticker.get("priceChangePercent", 0)
-        ),
-        "volume": float(
-            ticker.get("volume", 0)
-        ),
-        "turnover": float(
-            ticker.get("turnover", 0)
-        ),
-    }
+        return data[0]
+
+    return data or {}
 
 
-# =========================================================
+# ============================================================
 # CURRENT OPEN INTEREST
-# =========================================================
+# ============================================================
 
 def get_current_open_interest(symbol):
     """
-    دریافت OI لحظه‌ای.
+    Get current futures open interest.
     """
 
     data = api_get(
         "/api/ua/v2/market/open-interest",
-        {
+        params={
             "symbol": symbol,
         },
     )
 
-    if not data:
-        raise RuntimeError(
-            f"Open Interest data is empty: {symbol}"
-        )
-
     if isinstance(data, list):
-        item = data[0]
-    elif isinstance(data, dict):
-        item = data
-    else:
-        raise RuntimeError(
-            f"Unexpected OI response: {data}"
-        )
+        if not data:
+            return {}
 
-    oi_value = (
-        item.get("openInterest")
-        or item.get("openInterestValue")
-    )
+        return data[0]
 
-    if oi_value is None:
-        raise RuntimeError(
-            f"OI field not found: {item}"
-        )
-
-    return {
-        "open_interest": float(oi_value),
-        "timestamp": item.get("ts"),
-    }
+    return data or {}
 
 
-# =========================================================
+# ============================================================
 # HISTORICAL OPEN INTEREST
-# =========================================================
+# ============================================================
 
-def get_historical_open_interest(
-    symbol,
-    interval=OI_INTERVAL,
-):
+def get_historical_open_interest(symbol):
     """
-    دریافت OI تاریخی.
+    Get historical Open Interest.
 
-    KuCoin برای OI تاریخی:
+    KuCoin currently supports:
         5min
         15min
         30min
         1hour
         4hour
+        1day
 
-    تا 7 روز نگهداری می‌کند.
+    Historical retention:
+        5m/15m/30m/1h/4h -> 7 days
+        1d -> 70 days
     """
+
+    end_at = int(time.time() * 1000)
+
+    # فقط یک روز اخیر را می‌گیریم
+    start_at = end_at - (24 * 60 * 60 * 1000)
 
     data = api_get(
         "/api/ua/v2/market/open-interest",
-        {
+        params={
             "symbol": symbol,
-            "interval": interval,
+            "interval": OI_INTERVAL,
+            "startAt": start_at,
+            "endAt": end_at,
             "pageSize": 200,
         },
     )
 
-    if not data:
-        raise RuntimeError(
-            f"Historical OI is empty: {symbol}"
-        )
-
     if isinstance(data, dict):
-        rows = data.get("list", [])
-    elif isinstance(data, list):
-        rows = data
-    else:
-        rows = []
+        items = data.get("list", [])
 
-    result = []
+        if isinstance(items, list):
+            return items
 
-    for row in rows:
+    if isinstance(data, list):
+        return data
 
-        if isinstance(row, dict):
-
-            timestamp = (
-                row.get("ts")
-                or row.get("timestamp")
-                or row.get("time")
-            )
-
-            oi_value = (
-                row.get("openInterest")
-                or row.get("openInterestValue")
-            )
-
-            if oi_value is None:
-                continue
-
-            result.append(
-                {
-                    "timestamp": int(timestamp)
-                    if timestamp is not None
-                    else None,
-                    "open_interest": float(oi_value),
-                }
-            )
-
-        elif isinstance(row, list):
-
-            if len(row) >= 2:
-                result.append(
-                    {
-                        "timestamp": int(row[0]),
-                        "open_interest": float(row[1]),
-                    }
-                )
-
-    result.sort(
-        key=lambda x: (
-            x["timestamp"]
-            if x["timestamp"] is not None
-            else 0
-        )
-    )
-
-    return result
+    return []
 
 
-# =========================================================
-# FUNDING RATE
-# =========================================================
+# ============================================================
+# CURRENT FUNDING RATE
+# ============================================================
 
 def get_funding_rate(symbol):
     """
-    دریافت Funding Rate فعلی.
+    Get current futures funding rate.
     """
 
     data = api_get(
         "/api/ua/v2/market/funding-rate",
-        {
+        params={
             "symbol": symbol,
         },
     )
 
-    if not data:
-        raise RuntimeError(
-            f"Funding data is empty: {symbol}"
-        )
-
     if isinstance(data, list):
-        funding = data[0]
-    elif isinstance(data, dict):
-        funding = data
-    else:
-        raise RuntimeError(
-            f"Unexpected funding response: {data}"
-        )
+        if not data:
+            return {}
 
-    rate = funding.get(
-        "nextFundingRate"
-    )
+        return data[0]
 
-    if rate is None:
-        rate = funding.get(
-            "fundingRate"
-        )
-
-    if rate is None:
-        raise RuntimeError(
-            f"Funding rate field not found: {funding}"
-        )
-
-    return {
-        "funding_rate": float(rate),
-        "funding_percent": float(rate) * 100,
-        "funding_time": funding.get(
-            "fundingTime"
-        ),
-        "funding_cap": funding.get(
-            "fundingRateCap"
-        ),
-        "funding_floor": funding.get(
-            "fundingRateFloor"
-        ),
-    }
+    return data or {}
 
 
-# =========================================================
-# FUNDING HISTORY
-# =========================================================
+# ============================================================
+# FUNDING RATE HISTORY
+# ============================================================
 
 def get_funding_history(symbol):
     """
-    دریافت Funding Rate های قبلی.
+    Get historical funding rates.
+
+    IMPORTANT:
+    KuCoin V2 requires:
+        symbol
+        startAt
+        endAt
+
+    Response structure:
+
+    {
+        "symbol": "XBTUSDTM",
+        "list": [
+            {
+                "fundingRate": "...",
+                "ts": ...
+            }
+        ]
+    }
     """
+
+    end_at = int(time.time() * 1000)
+
+    start_at = end_at - (
+        FUNDING_HISTORY_HOURS * 60 * 60 * 1000
+    )
 
     data = api_get(
         "/api/ua/v2/market/funding-rate-history",
-        {
+        params={
             "symbol": symbol,
+            "startAt": start_at,
+            "endAt": end_at,
         },
     )
 
-    if not data:
-        return []
-
     if isinstance(data, dict):
-        rows = data.get("list", [])
-    elif isinstance(data, list):
-        rows = data
-    else:
-        rows = []
+        items = data.get("list", [])
 
-    result = []
+        if isinstance(items, list):
+            return items
 
-    for row in rows:
+    if isinstance(data, list):
+        return data
 
-        if not isinstance(row, dict):
-            continue
-
-        rate = row.get(
-            "fundingRate"
-        )
-
-        timestamp = row.get(
-            "ts"
-        )
-
-        if rate is None:
-            continue
-
-        result.append(
-            {
-                "timestamp": int(timestamp)
-                if timestamp is not None
-                else None,
-                "funding_rate": float(rate),
-            }
-        )
-
-    result.sort(
-        key=lambda x: (
-            x["timestamp"]
-            if x["timestamp"] is not None
-            else 0
-        )
-    )
-
-    return result
+    return []
 
 
-# =========================================================
+# ============================================================
 # KLINES
-# =========================================================
+# ============================================================
 
-def get_klines(
-    symbol,
-    interval=INTERVAL,
-):
+def get_klines(symbol):
     """
-    دریافت کندل‌های Futures.
+    Get futures candlestick data.
     """
 
     data = api_get(
         "/api/ua/v2/market/kline",
-        {
+        params={
             "symbol": symbol,
-            "tradeType": "FUTURES",
-            "klineType": "TRADE",
-            "interval": interval,
+            "interval": KLINE_INTERVAL,
+            "limit": KLINE_LIMIT,
         },
     )
 
-    if not data:
-        raise RuntimeError(
-            f"Kline data is empty: {symbol}"
-        )
-
     if isinstance(data, dict):
-        rows = data.get("list", [])
-    elif isinstance(data, list):
-        rows = data
-    else:
-        rows = []
+        items = data.get("list", [])
 
-    candles = []
+        if isinstance(items, list):
+            return items
 
-    for row in rows:
+    if isinstance(data, list):
+        return data
 
-        if not isinstance(row, list):
-            continue
-
-        if len(row) < 7:
-            continue
-
-        try:
-            candle = {
-                "timestamp": int(row[0]),
-                "open": float(row[1]),
-                "high": float(row[2]),
-                "low": float(row[3]),
-                "close": float(row[4]),
-                "volume": float(row[5]),
-                "turnover": float(row[6]),
-            }
-
-            candles.append(candle)
-
-        except (
-            ValueError,
-            TypeError,
-        ):
-            continue
-
-    candles.sort(
-        key=lambda x: x["timestamp"]
-    )
-
-    if KLINE_LIMIT:
-        candles = candles[-KLINE_LIMIT:]
-
-    return candles
+    return []
 
 
-# =========================================================
-# PRICE CHANGE
-# =========================================================
+# ============================================================
+# SAFE FLOAT
+# ============================================================
 
-def percentage_change(old, new):
-    if old == 0:
+def safe_float(value, default=0.0):
+    """
+    Safely convert value to float.
+    """
+
+    try:
+        if value is None:
+            return default
+
+        return float(value)
+
+    except (TypeError, ValueError):
+        return default
+
+
+# ============================================================
+# PERCENTAGE CHANGE
+# ============================================================
+
+def percentage_change(old_value, new_value):
+    """
+    Calculate percentage change.
+    """
+
+    old_value = safe_float(old_value)
+    new_value = safe_float(new_value)
+
+    if old_value == 0:
         return 0.0
 
-    return (
-        (new - old)
-        / old
-        * 100
-    )
+    return ((new_value - old_value) / old_value) * 100.0
 
 
-# =========================================================
+# ============================================================
 # OI ANALYSIS
-# =========================================================
+# ============================================================
 
 def analyze_oi(oi_history):
     """
-    محاسبه تغییر OI نسبت به نقاط قبلی.
+    Analyze Open Interest changes over:
+
+        15 minutes
+        30 minutes
+        1 hour
     """
 
     if not oi_history:
         return {
-            "oi_change": 0.0,
-            "oi_change_2": 0.0,
-            "oi_change_4": 0.0,
+            "oi_current": 0.0,
+            "oi_change_15m": 0.0,
+            "oi_change_30m": 0.0,
+            "oi_change_1h": 0.0,
         }
 
-    values = [
-        x["open_interest"]
-        for x in oi_history
-    ]
+    # مرتب‌سازی بر اساس timestamp
+    normalized = []
 
-    latest = values[-1]
+    for item in oi_history:
+        if not isinstance(item, dict):
+            continue
 
-    change_1 = 0.0
-    change_2 = 0.0
-    change_4 = 0.0
-
-    if len(values) >= 2:
-        change_1 = percentage_change(
-            values[-2],
-            latest,
+        ts = safe_float(
+            item.get("ts")
+            or item.get("time")
+            or item.get("timestamp")
         )
 
-    if len(values) >= 3:
-        change_2 = percentage_change(
-            values[-3],
-            latest,
+        oi = safe_float(
+            item.get("openInterest")
+            or item.get("openInterestValue")
+            or item.get("value")
         )
 
-    if len(values) >= 5:
-        change_4 = percentage_change(
-            values[-5],
-            latest,
+        if ts > 0 and oi != 0:
+            normalized.append(
+                {
+                    "ts": ts,
+                    "oi": oi,
+                }
+            )
+
+    if not normalized:
+        return {
+            "oi_current": 0.0,
+            "oi_change_15m": 0.0,
+            "oi_change_30m": 0.0,
+            "oi_change_1h": 0.0,
+        }
+
+    normalized.sort(key=lambda x: x["ts"])
+
+    current = normalized[-1]["oi"]
+
+    current_ts = normalized[-1]["ts"]
+
+    def find_previous(minutes):
+        target_ts = current_ts - (
+            minutes * 60 * 1000
+        )
+
+        closest = None
+        closest_distance = None
+
+        for item in normalized:
+            distance = abs(item["ts"] - target_ts)
+
+            if closest_distance is None or distance < closest_distance:
+                closest = item
+                closest_distance = distance
+
+        return closest
+
+    item_15m = find_previous(15)
+    item_30m = find_previous(30)
+    item_1h = find_previous(60)
+
+    change_15m = 0.0
+    change_30m = 0.0
+    change_1h = 0.0
+
+    if item_15m:
+        change_15m = percentage_change(
+            item_15m["oi"],
+            current,
+        )
+
+    if item_30m:
+        change_30m = percentage_change(
+            item_30m["oi"],
+            current,
+        )
+
+    if item_1h:
+        change_1h = percentage_change(
+            item_1h["oi"],
+            current,
         )
 
     return {
-        "oi_change": change_1,
-        "oi_change_2": change_2,
-        "oi_change_4": change_4,
+        "oi_current": current,
+        "oi_change_15m": change_15m,
+        "oi_change_30m": change_30m,
+        "oi_change_1h": change_1h,
     }
 
 
-# =========================================================
-# PRICE / VOLUME ANALYSIS
-# =========================================================
+# ============================================================
+# CANDLE ANALYSIS
+# ============================================================
 
-def analyze_candles(candles):
+def analyze_candles(klines):
+    """
+    Analyze price movement from 15m candles.
+    """
+
+    if not klines:
+        return {
+            "price_current": 0.0,
+            "price_change_15m": 0.0,
+            "price_change_1h": 0.0,
+            "volume_24h": 0.0,
+        }
+
+    candles = []
+
+    for candle in klines:
+
+        if isinstance(candle, dict):
+
+            ts = safe_float(
+                candle.get("ts")
+                or candle.get("timestamp")
+                or candle.get("time")
+            )
+
+            close = safe_float(
+                candle.get("close")
+            )
+
+            volume = safe_float(
+                candle.get("volume")
+            )
+
+        elif isinstance(candle, list) and len(candle) >= 6:
+
+            # KuCoin candle array:
+            # [timestamp, open, close, high, low, volume, turnover]
+            ts = safe_float(candle[0])
+            close = safe_float(candle[2])
+            volume = safe_float(candle[5])
+
+        else:
+            continue
+
+        if ts > 0 and close > 0:
+            candles.append(
+                {
+                    "ts": ts,
+                    "close": close,
+                    "volume": volume,
+                }
+            )
 
     if not candles:
         return {
+            "price_current": 0.0,
             "price_change_15m": 0.0,
             "price_change_1h": 0.0,
-            "volume_change": 0.0,
+            "volume_24h": 0.0,
         }
 
-    closes = [
-        x["close"]
-        for x in candles
-    ]
+    candles.sort(key=lambda x: x["ts"])
 
-    volumes = [
-        x["volume"]
-        for x in candles
-    ]
+    current_price = candles[-1]["close"]
 
-    latest_close = closes[-1]
+    price_15m = (
+        candles[-2]["close"]
+        if len(candles) >= 2
+        else current_price
+    )
 
-    price_15m = 0.0
-    price_1h = 0.0
+    price_1h = (
+        candles[-5]["close"]
+        if len(candles) >= 5
+        else candles[0]["close"]
+    )
 
-    if len(closes) >= 2:
-        price_15m = percentage_change(
-            closes[-2],
-            latest_close,
-        )
-
-    if len(closes) >= 5:
-        price_1h = percentage_change(
-            closes[-5],
-            latest_close,
-        )
-
-    volume_change = 0.0
-
-    if len(volumes) >= 6:
-
-        previous_volume = sum(
-            volumes[-6:-1]
-        ) / 5
-
-        latest_volume = volumes[-1]
-
-        if previous_volume != 0:
-            volume_change = (
-                (
-                    latest_volume
-                    - previous_volume
-                )
-                / previous_volume
-                * 100
-            )
+    volume_24h = sum(
+        candle["volume"]
+        for candle in candles
+    )
 
     return {
-        "price_change_15m": price_15m,
-        "price_change_1h": price_1h,
-        "volume_change": volume_change,
+        "price_current": current_price,
+
+        "price_change_15m": percentage_change(
+            price_15m,
+            current_price,
+        ),
+
+        "price_change_1h": percentage_change(
+            price_1h,
+            current_price,
+        ),
+
+        "volume_24h": volume_24h,
     }
 
 
-# =========================================================
-# MARKET ANALYSIS
-# =========================================================
+# ============================================================
+# FUNDING ANALYSIS
+# ============================================================
+
+def analyze_funding(funding_current, funding_history):
+    """
+    Analyze current and historical funding.
+    """
+
+    current_rate = 0.0
+    next_rate = 0.0
+
+    if isinstance(funding_current, dict):
+
+        current_rate = safe_float(
+            funding_current.get("fundingRate")
+            or funding_current.get("value")
+            or funding_current.get("currentFundingRate")
+        )
+
+        next_rate = safe_float(
+            funding_current.get("nextFundingRate")
+        )
+
+    history_rates = []
+
+    for item in funding_history:
+
+        if not isinstance(item, dict):
+            continue
+
+        rate = safe_float(
+            item.get("fundingRate")
+        )
+
+        history_rates.append(rate)
+
+    average_rate = 0.0
+
+    if history_rates:
+        average_rate = (
+            sum(history_rates)
+            / len(history_rates)
+        )
+
+    return {
+        "funding_rate": current_rate,
+        "next_funding_rate": next_rate,
+        "average_funding_rate": average_rate,
+        "funding_history_count": len(history_rates),
+    }
+
+
+# ============================================================
+# MARKET CLASSIFICATION
+# ============================================================
+
+def classify_market(
+    price_change_1h,
+    oi_change_1h,
+):
+    """
+    Basic Price/OI market classification.
+
+    This is NOT a trading signal.
+
+    Four main states:
+
+        PRICE_UP_OI_UP
+        PRICE_DOWN_OI_UP
+        PRICE_UP_OI_DOWN
+        PRICE_DOWN_OI_DOWN
+
+    Otherwise:
+
+        NEUTRAL
+    """
+
+    price_up = price_change_1h > 0
+    price_down = price_change_1h < 0
+
+    oi_up = oi_change_1h > 0
+    oi_down = oi_change_1h < 0
+
+    if price_up and oi_up:
+        return "PRICE_UP_OI_UP"
+
+    if price_down and oi_up:
+        return "PRICE_DOWN_OI_UP"
+
+    if price_up and oi_down:
+        return "PRICE_UP_OI_DOWN"
+
+    if price_down and oi_down:
+        return "PRICE_DOWN_OI_DOWN"
+
+    return "NEUTRAL"
+
+
+# ============================================================
+# SYMBOL ANALYSIS
+# ============================================================
 
 def analyze_symbol(symbol):
+    """
+    Collect all available market data for one symbol.
+    """
+
+    logger.info(
+        "Scanning %s",
+        symbol,
+    )
+
+    # --------------------------------------------------------
+    # API requests
+    # --------------------------------------------------------
 
     ticker = get_ticker(symbol)
 
-    current_oi = get_current_open_interest(
-        symbol
+    current_oi = get_current_open_interest(symbol)
+
+    historical_oi = get_historical_open_interest(symbol)
+
+    funding_current = get_funding_rate(symbol)
+
+    funding_history = get_funding_history(symbol)
+
+    klines = get_klines(symbol)
+
+    # --------------------------------------------------------
+    # Ticker
+    # --------------------------------------------------------
+
+    ticker_price = safe_float(
+        ticker.get("price")
+        or ticker.get("lastPrice")
     )
 
-    historical_oi = get_historical_open_interest(
-        symbol
+    price_change_24h = safe_float(
+        ticker.get("priceChangePercent")
+        or ticker.get("changeRate")
+        or ticker.get("priceChange")
     )
 
-    funding = get_funding_rate(
-        symbol
+    volume_24h = safe_float(
+        ticker.get("volume")
+        or ticker.get("vol")
+        or ticker.get("volume24h")
     )
 
-    funding_history = get_funding_history(
-        symbol
+    # --------------------------------------------------------
+    # Current OI
+    # --------------------------------------------------------
+
+    current_oi_value = safe_float(
+        current_oi.get("openInterest")
+        or current_oi.get("openInterestValue")
+        or current_oi.get("value")
     )
 
-    candles = get_klines(
-        symbol
-    )
+    # --------------------------------------------------------
+    # OI analysis
+    # --------------------------------------------------------
 
     oi_analysis = analyze_oi(
         historical_oi
     )
 
+    # اگر current OI endpoint مقدار معتبرتری داشت
+    if current_oi_value > 0:
+        oi_analysis["oi_current"] = current_oi_value
+
+    # --------------------------------------------------------
+    # Candle analysis
+    # --------------------------------------------------------
+
     candle_analysis = analyze_candles(
-        candles
+        klines
     )
 
-    return {
+    # --------------------------------------------------------
+    # Funding analysis
+    # --------------------------------------------------------
+
+    funding_analysis = analyze_funding(
+        funding_current,
+        funding_history,
+    )
+
+    # --------------------------------------------------------
+    # Market classification
+    # --------------------------------------------------------
+
+    market_state = classify_market(
+        candle_analysis["price_change_1h"],
+        oi_analysis["oi_change_1h"],
+    )
+
+    # --------------------------------------------------------
+    # Final result
+    # --------------------------------------------------------
+
+    result = {
         "symbol": symbol,
 
-        "price": ticker["price"],
-
-        "price_change_24h": (
-            ticker["price_change_percent"]
+        "price": (
+            ticker_price
+            or candle_analysis["price_current"]
         ),
 
-        "volume_24h": ticker["volume"],
+        "price_change_24h": price_change_24h,
 
-        "turnover_24h": ticker["turnover"],
+        "price_change_15m": candle_analysis[
+            "price_change_15m"
+        ],
 
-        "open_interest": (
-            current_oi["open_interest"]
+        "price_change_1h": candle_analysis[
+            "price_change_1h"
+        ],
+
+        "oi_current": oi_analysis[
+            "oi_current"
+        ],
+
+        "oi_change_15m": oi_analysis[
+            "oi_change_15m"
+        ],
+
+        "oi_change_30m": oi_analysis[
+            "oi_change_30m"
+        ],
+
+        "oi_change_1h": oi_analysis[
+            "oi_change_1h"
+        ],
+
+        "funding_rate": funding_analysis[
+            "funding_rate"
+        ],
+
+        "next_funding_rate": funding_analysis[
+            "next_funding_rate"
+        ],
+
+        "average_funding_rate": funding_analysis[
+            "average_funding_rate"
+        ],
+
+        "funding_history_count": funding_analysis[
+            "funding_history_count"
+        ],
+
+        "volume_24h": (
+            volume_24h
+            or candle_analysis["volume_24h"]
         ),
 
-        "funding_rate": (
-            funding["funding_rate"]
-        ),
+        "kline_count": len(klines),
 
-        "funding_percent": (
-            funding["funding_percent"]
-        ),
-
-        "funding_time": (
-            funding["funding_time"]
-        ),
-
-        "oi_change_15m": (
-            oi_analysis["oi_change"]
-        ),
-
-        "oi_change_30m": (
-            oi_analysis["oi_change_2"]
-        ),
-
-        "oi_change_1h": (
-            oi_analysis["oi_change_4"]
-        ),
-
-        "price_change_15m": (
-            candle_analysis[
-                "price_change_15m"
-            ]
-        ),
-
-        "price_change_1h": (
-            candle_analysis[
-                "price_change_1h"
-            ]
-        ),
-
-        "volume_change": (
-            candle_analysis[
-                "volume_change"
-            ]
-        ),
-
-        "funding_history_count": len(
-            funding_history
-        ),
-
-        "kline_count": len(
-            candles
-        ),
+        "market_state": market_state,
     }
 
-
-# =========================================================
-# MARKET INTERPRETATION
-# =========================================================
-
-def classify_market(data):
-    """
-    این قسمت فعلاً فقط وضعیت بازار را توصیف می‌کند.
-
-    هنوز BUY / SELL واقعی نیست.
-    """
-
-    price_change = (
-        data["price_change_15m"]
-    )
-
-    oi_change = (
-        data["oi_change_15m"]
-    )
-
-    funding = (
-        data["funding_rate"]
-    )
-
-    volume_change = (
-        data["volume_change"]
-    )
-
-    if (
-        price_change > 0
-        and oi_change > 0
-    ):
-        state = "PRICE_UP_OI_UP"
-
-    elif (
-        price_change < 0
-        and oi_change > 0
-    ):
-        state = "PRICE_DOWN_OI_UP"
-
-    elif (
-        price_change > 0
-        and oi_change < 0
-    ):
-        state = "PRICE_UP_OI_DOWN"
-
-    elif (
-        price_change < 0
-        and oi_change < 0
-    ):
-        state = "PRICE_DOWN_OI_DOWN"
-
-    else:
-        state = "NEUTRAL"
-
-    return {
-        "state": state,
-        "price_change": price_change,
-        "oi_change": oi_change,
-        "funding": funding,
-        "volume_change": volume_change,
-    }
+    return result
 
 
 # =========================================================
-# PRINT RESULT
-# =========================================================
-
-def print_result(data):
-
-    market = classify_market(
-        data
-    )
-
-    print()
-    print("=" * 72)
-    print(
-        f" {data['symbol']}"
-    )
-    print("=" * 72)
-
-    print(
-        f"Price              : "
-        f"{data['price']:,.6f}"
-    )
-
-    print(
-        f"24h Price Change   : "
-        f"{data['price_change_24h']:+.3f}%"
-    )
-
-    print(
-        f"15m Price Change   : "
-        f"{data['price_change_15m']:+.3f}%"
-    )
-
-    print(
-        f"1h Price Change    : "
-        f"{data['price_change_1h']:+.3f}%"
-    )
-
-    print(
-        f"Open Interest      : "
-        f"{data['open_interest']:,.4f}"
-    )
-
-    print(
-        f"OI Change 15m      : "
-        f"{data['oi_change_15m']:+.3f}%"
-    )
-
-    print(
-        f"OI Change 30m      : "
-        f"{data['oi_change_30m']:+.3f}%"
-    )
-
-    print(
-        f"OI Change 1h       : "
-        f"{data['oi_change_1h']:+.3f}%"
-    )
-
-    print(
-        f"Funding Rate       : "
-        f"{data['funding_rate']:+.8f}"
-    )
-
-    print(
-        f"Funding %          : "
-        f"{data['funding_percent']:+.5f}%"
-    )
-
-    print(
-        f"24h Volume         : "
-        f"{data['volume_24h']:,.4f}"
-    )
-
-    print(
-        f"Volume Change      : "
-        f"{data['volume_change']:+.2f}%"
-    )
-
-    print(
-        f"Market State       : "
-        f"{market['state']}"
-    )
-
-    print(
-        f"Klines Loaded      : "
-        f"{data['kline_count']}"
-    )
-
-    print("=" * 72)
-
-
-# =========================================================
-# MAIN SCANNER
-# =========================================================
-
-def main():
-
-    start_time = time.time()
-
-    logger.info(
-        "KuCoin strategy scanner started"
-    )
-
-    logger.info(
-        "UTC time: %s",
-        datetime.now(
-            timezone.utc
-        ).strftime(
-            "%Y-%m-%d %H:%M:%S"
-        ),
-    )
-
-    results = []
-
-    with ThreadPoolExecutor(
-        max_workers=MAX_WORKERS
-    ) as executor:
-
-        future_map = {
-            executor.submit(
-                analyze_symbol,
-                symbol,
-            ): symbol
-            for symbol in SYMBOLS
-        }
-
-        for future in as_completed(
-            future_map
-        ):
-
-            symbol = future_map[
-                future
-            ]
-
-            try:
-
-                result = future.result()
-
-                results.append(
-                    result
-                )
-
-                print_result(
-                    result
-                )
-
-                logger.info(
-                    "%s scanned successfully",
-                    symbol,
-                )
-
-            except Exception as exc:
-
-                logger.exception(
-                    "Error scanning %s: %s",
-                    symbol,
-                    exc,
-                )
-
-    elapsed = (
-        time.time()
-        - start_time
-    )
-
-    print()
-    print("=" * 72)
-
-    print(
-        f"Scan completed | "
-        f"Symbols: {len(results)}/{len(SYMBOLS)} | "
-        f"Time: {elapsed:.2f}s"
-    )
-
-    print("=" * 72)
-
-    return results
-
-
-# =========================================================
-# ENTRY POINT
-# =========================================================
-
-if __name__ == "__main__":
-    main()
