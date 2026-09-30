@@ -21,6 +21,28 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Check files
+        run: |
+          echo "Current directory:"
+          pwd
+
+          echo "Files:"
+          ls -la
+
+          echo "Python:"
+          python --version
+
+          echo "KuCoin script:"
+          ls -l kucoin_strategy.py
+
       - name: Run KuCoin scanner
         run: |
-          python kucoin_strategy.py
+          echo "========================================"
+          echo "Starting kucoin_strategy.py"
+          echo "========================================"
+
+          python -u kucoin_strategy.py
+
+          echo "========================================"
+          echo "Python script finished"
+          echo "========================================"
