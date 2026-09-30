@@ -115,7 +115,7 @@ def get_ticker(symbol):
     """
 
     data = api_get(
-        "//api/ua/v1/market/ticker?tradeType=FUTURES&symbol=XBTUSDTM,
+        "//api/ua/v1/market/ticker?tradeType=FUTURES&symbol=XBTUSDTM",
         params={
             "symbol": symbol,
         },
