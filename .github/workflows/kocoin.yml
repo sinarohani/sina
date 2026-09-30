@@ -1,48 +1,73 @@
-name: KuCoin Market Scanner
+name: CoinGlass Signal
 
+# Triggered ONLY by an external cron (cron-job.org etc.) via the GitHub API.
+# No `schedule:` on purpose: GitHub's built-in cron is delayed and unreliable.
 on:
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Log signals only, do not send to Telegram"
+        type: boolean
+        default: false
+
+# Never run two cycles at once (protects API limits and the cooldown state)
+concurrency:
+  group: signal-bot
+  cancel-in-progress: false
+
+permissions:
+  contents: read
 
 jobs:
-  scan:
+  run:
     runs-on: ubuntu-latest
-
+    timeout-minutes: 5
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v6
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: pip
 
-      - name: Install dependencies
+      - run: pip install -r requirements.txt
+
+      # Restore cooldown state from the previous run
+      - name: Restore state
+        uses: actions/cache/restore@v4
+        with:
+          path: state.json
+          key: bot-state-${{ github.run_id }}
+          restore-keys: bot-state-
+
+      - name: Run one cycle
+        env:
+          COINGLASS_API_KEY: ${{ secrets.COINGLASS_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          EXCHANGE: Binance
+          SYMBOLS: BTCUSDT,ETHUSDT
+          INTERVAL: h4
+          SIGNAL_THRESHOLD: "0.45"
+          COOLDOWN_HOURS: "8"
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          python coinglass_signal_bot.py --once \
+            ${{ inputs.dry_run && '--dry-run' || '' }} \
+            --log-level INFO
 
-      - name: Check files
-        run: |
-          echo "Current directory:"
-          pwd
+      # Save state even if the run failed halfway
+      - name: Save state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state.json
+          key: bot-state-${{ github.run_id }}
 
-          echo "Files:"
-          ls -la
-
-          echo "Python:"
-          python --version
-
-          echo "KuCoin script:"
-          ls -l kucoin_strategy.py
-
-      - name: Run KuCoin scanner
-        run: |
-          echo "========================================"
-          echo "Starting kucoin_strategy.py"
-          echo "========================================"
-
-          python -u kucoin_strategy.py
-
-          echo "========================================"
-          echo "Python script finished"
-          echo "========================================"
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bot-logs-${{ github.run_id }}
+          path: logs/
+          retention-days: 3
+          if-no-files-found: ignore
