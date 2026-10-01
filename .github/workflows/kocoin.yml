@@ -1,4 +1,4 @@
-name: CoinGlass Signal
+name: Derivatives Signal
 
 # Triggered ONLY by an external cron (cron-job.org etc.) via the GitHub API.
 # No `schedule:` on purpose: GitHub's built-in cron is delayed and unreliable.
@@ -42,16 +42,15 @@ jobs:
 
       - name: Run one cycle
         env:
-          COINGLASS_API_KEY: ${{ secrets.COINGLASS_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          EXCHANGE: Binance
+          PROVIDERS: kucoin
           SYMBOLS: BTCUSDT,ETHUSDT
-          INTERVAL: h4
+          INTERVAL: 4h
           SIGNAL_THRESHOLD: "0.45"
           COOLDOWN_HOURS: "8"
         run: |
-          python coinglass_signal_bot.py --once \
+          python derivatives_signal_bot.py --once \
             ${{ inputs.dry_run && '--dry-run' || '' }} \
             --log-level INFO
 
