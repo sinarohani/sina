@@ -1,20 +1,23 @@
 #!/usr/bin/env python3
 """
-Free Derivatives Signal Bot (no paid API)
-=========================================
-Uses PUBLIC futures endpoints of KuCoin, Binance and Bybit (no API key needed),
-scores the market with a multi-factor strategy and sends LONG / SHORT signals
-to Telegram.
+Free Derivatives Signal Bot v2 (no paid API)
+============================================
+Public futures endpoints of KuCoin, Binance and Bybit (no API key needed),
+multi-factor scoring, LONG/SHORT signals to Telegram.
 
-Factors (each in [-1, +1], positive = bullish):
-  1. Funding rate      - contrarian (crowded longs => bearish)
-  2. Open interest     - trend confirmation (price + OI moving together)
-  3. Long/Short ratio  - contrarian on account-positioning extremes
-  4. Taker buy/sell    - aggressive-flow momentum (Binance only)
-  5. Trend (EMA)       - price-trend filter (all providers)
+Changes vs v1:
+  * Unclosed (in-progress) candle is dropped before any calculation -> no repaint
+  * Rolling z-score (default 40-candle window) instead of full-history z
+  * Funding scored against an ABSOLUTE extreme threshold (default 0.05%),
+    not a noisy z-score - funding edge exists mainly at crowded extremes
+  * ADX regime filter: in trend, trend factor weighted up and contrarian
+    factors down; in range, the opposite. Weights renormalised automatically.
+  * ATR computed with Wilder smoothing
+  * Risk-based position sizing (qty from capital * risk% / stop distance)
+  * Round-trip taker fee shown on every signal
+  * Cooldown applies to BOTH sides: same-side = full window, flip = short window
+  * KuCoin OI history survives restarts as long as state.json is kept
 
-If a factor is unavailable from a provider it is skipped and the remaining
-weights are re-normalised. Providers are tried in order (fallback).
 NOT financial advice - backtest / paper trade first.
 """
 from __future__ import annotations
@@ -58,27 +61,30 @@ class Config:
     bybit_url: str = "https://api.bybit.com"
     symbols: list[str] = field(default_factory=lambda: ["BTCUSDT", "ETHUSDT"])
     interval: str = "4h"
-    limit: int = 100
+    limit: int = 200
     poll_seconds: int = 900
     request_delay: float = 0.3
     timeout: int = 15
     max_retries: int = 3
     # strategy
     signal_threshold: float = 0.45
-    w_funding: float = 0.25
-    w_oi: float = 0.30
-    w_ls: float = 0.20
-    w_flow: float = 0.25
-    w_trend: float = 0.20
-    ema_fast: int = 20
-    ema_slow: int = 50
+    rolling_z_window: int = 40        # window for rolling z-score
+    funding_extreme: float = 0.0005   # |funding| >= 0.05% is "crowded"
+    adx_period: int = 14
+    adx_trend_min: float = 20.0       # ADX >= this => trending regime
     oi_change_threshold_pct: float = 2.0
     trend_lookback: int = 6
+    # risk
     atr_period: int = 14
     sl_atr_mult: float = 1.5
     tp1_atr_mult: float = 1.5
     tp2_atr_mult: float = 3.0
+    capital_usdt: float = 0.0         # 0 disables position sizing output
+    risk_pct: float = 1.0             # % of capital risked per trade
+    taker_fee: float = 0.0005         # per side, for cost display
+    # cooldown
     cooldown_hours: float = 8.0
+    flip_cooldown_factor: float = 0.33
     state_file: str = "state.json"
     log_dir: str = "logs"
 
@@ -97,10 +103,17 @@ class Config:
             limit=int(_env("LIMIT", str(d.limit))),
             poll_seconds=int(_env("POLL_SECONDS", str(d.poll_seconds))),
             signal_threshold=float(_env("SIGNAL_THRESHOLD", str(d.signal_threshold))),
-            cooldown_hours=float(_env("COOLDOWN_HOURS", str(d.cooldown_hours))),
+            rolling_z_window=int(_env("ROLLING_Z_WINDOW", str(d.rolling_z_window))),
+            funding_extreme=float(_env("FUNDING_EXTREME", str(d.funding_extreme))),
+            adx_period=int(_env("ADX_PERIOD", str(d.adx_period))),
+            adx_trend_min=float(_env("ADX_TREND_MIN", str(d.adx_trend_min))),
             sl_atr_mult=float(_env("SL_ATR_MULT", str(d.sl_atr_mult))),
             tp1_atr_mult=float(_env("TP1_ATR_MULT", str(d.tp1_atr_mult))),
             tp2_atr_mult=float(_env("TP2_ATR_MULT", str(d.tp2_atr_mult))),
+            capital_usdt=float(_env("CAPITAL_USDT", str(d.capital_usdt))),
+            risk_pct=float(_env("RISK_PCT", str(d.risk_pct))),
+            cooldown_hours=float(_env("COOLDOWN_HOURS", str(d.cooldown_hours))),
+            flip_cooldown_factor=float(_env("FLIP_COOLDOWN_FACTOR", str(d.flip_cooldown_factor))),
             state_file=_env("STATE_FILE", d.state_file),
             log_dir=_env("LOG_DIR", d.log_dir),
         )
@@ -180,7 +193,7 @@ class Http:
 
 
 # --------------------------------------------------------------------------- #
-# Data providers (all series oldest -> newest)
+# Data providers (all series oldest -> newest, CLOSED candles only)
 # --------------------------------------------------------------------------- #
 @dataclass
 class MarketData:
@@ -188,11 +201,36 @@ class MarketData:
     close: list[float]
     high: list[float]
     low: list[float]
+    times: list[int] = field(default_factory=list)  # candle open time (ms)
     funding: list[float] | None = None
     oi: list[float] | None = None
     ls: list[float] | None = None      # long/short account ratio
     flow: list[float] | None = None    # taker buy/sell ratio
     oi_change_pct: float | None = None  # pre-computed OI change (providers without OI history)
+
+
+def trim_open_candle(md: MarketData, interval_min: int) -> MarketData:
+    """Drop the in-progress candle so every calculation runs on closed data."""
+    if not md.times or not md.close:
+        return md
+    step_ms = interval_min * 60_000
+    now_ms = time.time() * 1000
+    dropped = 0
+    while md.times and md.times[-1] + step_ms > now_ms + 5_000:  # 5s clock skew guard
+        md.times.pop(); md.close.pop(); md.high.pop(); md.low.pop()
+        if md.oi:
+            md.oi.pop()
+        if md.ls:
+            md.ls.pop()
+        if md.flow:
+            md.flow.pop()
+        dropped += 1
+        if dropped > 3:  # safety, should never loop more than once
+            break
+    # funding series is SETTLED history - it is never affected by the open candle
+    if dropped:
+        log.info("%s: dropped %d unclosed candle(s)", md.source, dropped)
+    return md
 
 
 class Provider:
@@ -204,7 +242,7 @@ class Provider:
     def fetch(self, symbol: str) -> MarketData:
         raise NotImplementedError
 
-    def _optional(self, label: str, symbol: str, fn: Callable[[], list[float]]) -> list[float] | None:
+    def _optional(self, label: str, symbol: str, fn: Callable) -> list[float] | None:
         time.sleep(self.cfg.request_delay)
         try:
             values = fn()
@@ -228,8 +266,11 @@ class BinanceProvider(Provider):
         kl = self._get("/fapi/v1/klines", symbol=symbol, interval=iv, limit=n)
         if not isinstance(kl, list) or not kl:
             raise ApiError(f"empty klines: {str(kl)[:120]}")
-        md = MarketData(self.name, [float(k[4]) for k in kl],
-                        [float(k[2]) for k in kl], [float(k[3]) for k in kl])
+        md = MarketData(self.name,
+                        [float(k[4]) for k in kl],
+                        [float(k[2]) for k in kl],
+                        [float(k[3]) for k in kl],
+                        [int(k[0]) for k in kl])
         md.funding = self._optional("funding", symbol, lambda: [
             float(x["fundingRate"]) for x in self._get("/fapi/v1/fundingRate", symbol=symbol, limit=n)])
         md.oi = self._optional("open_interest", symbol, lambda: [
@@ -241,7 +282,7 @@ class BinanceProvider(Provider):
         md.flow = self._optional("taker_flow", symbol, lambda: [
             float(x["buySellRatio"]) for x in
             self._get("/futures/data/takerlongshortRatio", symbol=symbol, period=iv, limit=n)])
-        return md
+        return trim_open_candle(md, interval_minutes(iv))
 
 
 class BybitProvider(Provider):
@@ -264,8 +305,11 @@ class BybitProvider(Provider):
                                      interval=self.KLINE[iv], limit=n)))
         if not kl:
             raise ApiError("empty klines")
-        md = MarketData(self.name, [float(k[4]) for k in kl],
-                        [float(k[2]) for k in kl], [float(k[3]) for k in kl])
+        md = MarketData(self.name,
+                        [float(k[4]) for k in kl],
+                        [float(k[2]) for k in kl],
+                        [float(k[3]) for k in kl],
+                        [int(k[0]) for k in kl])
         md.funding = self._optional("funding", symbol, lambda: [
             float(x["fundingRate"]) for x in reversed(
                 self._get("/v5/market/funding/history", category="linear", symbol=symbol, limit=n))])
@@ -279,7 +323,7 @@ class BybitProvider(Provider):
                 float(x["buyRatio"]) / float(x["sellRatio"]) for x in reversed(
                     self._get("/v5/market/account-ratio", category="linear", symbol=symbol,
                               period=p, limit=n))])
-        return md
+        return trim_open_candle(md, interval_minutes(iv))
 
 
 class KuCoinProvider(Provider):
@@ -315,8 +359,11 @@ class KuCoinProvider(Provider):
         kl = sorted(kl or [], key=lambda k: k[0])
         if not kl:
             raise ApiError("empty klines")
-        md = MarketData(self.name, [float(k[4]) for k in kl],
-                        [float(k[2]) for k in kl], [float(k[3]) for k in kl])
+        md = MarketData(self.name,
+                        [float(k[4]) for k in kl],
+                        [float(k[2]) for k in kl],
+                        [float(k[3]) for k in kl],
+                        [int(k[0]) for k in kl])
 
         def funding() -> list[float]:
             data = self._get("/api/v1/contract/funding-rates", symbol=contract,
@@ -333,7 +380,7 @@ class KuCoinProvider(Provider):
             raise
         except Exception as exc:
             log.warning("kucoin/%s: open interest unavailable: %s", symbol, exc)
-        return md
+        return trim_open_candle(md, interval_minutes(iv))
 
     def _oi_change(self, symbol: str, contract: str) -> float | None:
         oi = float(self._get(f"/api/v1/contracts/{contract}")["openInterest"])
@@ -361,7 +408,7 @@ class KuCoinProvider(Provider):
 
 
 PROVIDERS: dict[str, type[Provider]] = {"kucoin": KuCoinProvider, "binance": BinanceProvider,
-                                     "bybit": BybitProvider}
+                                        "bybit": BybitProvider}
 
 
 def fetch_market(symbol: str, providers: list[Provider]) -> MarketData | None:
@@ -385,11 +432,13 @@ def clip(x: float, lo: float = -1.0, hi: float = 1.0) -> float:
     return max(lo, min(hi, x))
 
 
-def zscore(values: list[float]) -> float:
-    if len(values) < 10:
+def rolling_zscore(values: list[float], window: int) -> float:
+    """Z-score against a rolling window of CLOSED candles, not full history."""
+    w = values[-window:] if window > 0 else values
+    if len(w) < 10:
         return 0.0
-    sd = statistics.pstdev(values)
-    return 0.0 if sd == 0 else (values[-1] - statistics.fmean(values)) / sd
+    sd = statistics.pstdev(w)
+    return 0.0 if sd == 0 else (w[-1] - statistics.fmean(w)) / sd
 
 
 def pct_change(values: list[float], lookback: int) -> float:
@@ -409,13 +458,62 @@ def ema(values: list[float], period: int) -> float:
     return e
 
 
-def atr(high: list[float], low: list[float], close: list[float], period: int) -> float | None:
-    n = min(len(high), len(low), len(close))
-    if n <= period:
+def _rma(seq: list[float], period: int) -> list[float]:
+    """Wilder's smoothing (used by ATR/ADX)."""
+    a = statistics.fmean(seq[:period])
+    out = [a]
+    for x in seq[period:]:
+        a += (x - a) / period
+        out.append(a)
+    return out
+
+
+def true_ranges(high: list[float], low: list[float], close: list[float]) -> list[float]:
+    trs = []
+    for i in range(1, min(len(high), len(low), len(close))):
+        trs.append(max(high[i] - low[i],
+                       abs(high[i] - close[i - 1]),
+                       abs(low[i] - close[i - 1])))
+    return trs
+
+
+def atr_wilder(high: list[float], low: list[float], close: list[float], period: int) -> float | None:
+    trs = true_ranges(high, low, close)
+    if len(trs) < period:
         return None
-    trs = [max(high[i] - low[i], abs(high[i] - close[i - 1]), abs(low[i] - close[i - 1]))
-           for i in range(1, n)]
-    return statistics.fmean(trs[-period:])
+    return _rma(trs, period)[-1]
+
+
+def adx_wilder(high: list[float], low: list[float], close: list[float], period: int) -> float | None:
+    """Wilder ADX. Regime filter: >= ~20 trending, < 20 ranging."""
+    n = min(len(high), len(low), len(close))
+    if n < period * 2 + 2:
+        return None
+    plus_dm, minus_dm = [], []
+    for i in range(1, n):
+        up, dn = high[i] - high[i - 1], low[i - 1] - low[i]
+        plus_dm.append(up if (up > dn and up > 0) else 0.0)
+        minus_dm.append(dn if (dn > up and dn > 0) else 0.0)
+    trs = true_ranges(high, low, close)
+    m = min(len(trs), len(plus_dm), len(minus_dm))
+    atr_s = _rma(trs[:m], period)
+    pdi_s = _rma(plus_dm[:m], period)
+    mdi_s = _rma(minus_dm[:m], period)
+    k = min(len(atr_s), len(pdi_s), len(mdi_s))
+    dx = []
+    for i in range(k):
+        if atr_s[i] == 0:
+            dx.append(0.0)
+            continue
+        pdi, mdi = 100 * pdi_s[i] / atr_s[i], 100 * mdi_s[i] / atr_s[i]
+        s = pdi + mdi
+        dx.append(0.0 if s == 0 else 100 * abs(pdi - mdi) / s)
+    if len(dx) < period:
+        return None
+    a = statistics.fmean(dx[:period])
+    for x in dx[period:]:
+        a += (x - a) / period
+    return a
 
 
 # --------------------------------------------------------------------------- #
@@ -441,13 +539,18 @@ class Signal:
     atr: float
     source: str
     components: list[Component]
+    qty: float = 0.0
     created: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
 def score_funding(v: list[float], cfg: Config) -> Component:
-    z = zscore(v)
-    return Component("Funding", clip(-z / 2), cfg.w_funding,
-                     f"last={v[-1] * 100:.4f}% z={z:+.2f} (contrarian)")
+    """Contrarian at ABSOLUTE extremes: crowded longs (high positive funding)
+    => bearish. Below the extreme threshold the score stays small."""
+    f_now = v[-1]
+    score = clip(-f_now / cfg.funding_extreme) if cfg.funding_extreme > 0 else 0.0
+    z = rolling_zscore(v, cfg.rolling_z_window)
+    return Component("Funding", score, cfg.w_funding,
+                     f"last={f_now * 100:.4f}% (extreme=±{cfg.funding_extreme * 100:.3f}%) z={z:+.2f}")
 
 
 def score_oi(md: MarketData, cfg: Config) -> Component:
@@ -465,15 +568,15 @@ def score_oi(md: MarketData, cfg: Config) -> Component:
 
 
 def score_ls(v: list[float], cfg: Config) -> Component:
-    z = zscore(v)
+    z = rolling_zscore(v, cfg.rolling_z_window)
     return Component("LongShortRatio", clip(-z / 2), cfg.w_ls,
-                     f"ratio={v[-1]:.3f} z={z:+.2f} (contrarian)")
+                     f"ratio={v[-1]:.3f} rolling-z={z:+.2f} (contrarian)")
 
 
 def score_flow(v: list[float], cfg: Config) -> Component:
-    z = zscore(v)
+    z = rolling_zscore(v, cfg.rolling_z_window)
     return Component("TakerFlow", clip(z / 2), cfg.w_flow,
-                     f"buy/sell={v[-1]:.3f} z={z:+.2f} (momentum)")
+                     f"buy/sell={v[-1]:.3f} rolling-z={z:+.2f} (momentum)")
 
 
 def score_trend(close: list[float], cfg: Config) -> Component:
@@ -490,11 +593,24 @@ def evaluate(symbol: str, providers: list[Provider], cfg: Config) -> Signal | No
     if md is None:
         log.error("%s: no provider returned data, skipping", symbol)
         return None
-    if len(md.close) < cfg.atr_period + 2:
-        log.warning("%s: not enough candles (%d)", symbol, len(md.close))
+    if len(md.close) < max(cfg.ema_slow, cfg.rolling_z_window, cfg.adx_period * 2 + 2):
+        log.warning("%s: not enough closed candles (%d)", symbol, len(md.close))
         return None
 
-    jobs: list[tuple[str, bool, Callable[[], Component]]] = [
+    # ---- regime filter: tilt weights by ADX, renormalisation happens in the sum
+    adx_val = adx_wilder(md.high, md.low, md.close, cfg.adx_period)
+    trending = adx_val is not None and adx_val >= cfg.adx_trend_min
+    regime = "TRENDING" if trending else "RANGING"
+    log.info("%s | ADX=%s -> %s regime", symbol, f"{adx_val:.1f}" if adx_val else "n/a", regime)
+    wmap = {
+        "Funding":        cfg.w_funding * (0.75 if trending else 1.25),
+        "OpenInterest":   cfg.w_oi,
+        "LongShortRatio": cfg.w_ls * (0.75 if trending else 1.25),
+        "TakerFlow":      cfg.w_flow * (0.75 if trending else 1.25),
+        "Trend":          cfg.w_trend * (1.5 if trending else 0.5),
+    }
+
+    jobs: list[tuple[str, bool, Callable] = [
         ("funding", bool(md.funding), lambda: score_funding(md.funding or [], cfg)),
         ("open_interest", bool(md.oi) or md.oi_change_pct is not None, lambda: score_oi(md, cfg)),
         ("long_short", bool(md.ls), lambda: score_ls(md.ls or [], cfg)),
@@ -508,6 +624,7 @@ def evaluate(symbol: str, providers: list[Provider], cfg: Config) -> Signal | No
             continue
         try:
             c = fn()
+            c.weight = wmap.get(c.name, c.weight)
             comps.append(c)
             log.info("%s | %-14s score=%+.3f w=%.2f | %s", symbol, c.name, c.score, c.weight, c.detail)
         except Exception as exc:
@@ -518,22 +635,26 @@ def evaluate(symbol: str, providers: list[Provider], cfg: Config) -> Signal | No
         return None
 
     total = sum(c.score * c.weight for c in comps) / sum(c.weight for c in comps)
-    log.info("%s | TOTAL score=%+.3f (threshold ±%.2f) from %d factors",
-             symbol, total, cfg.signal_threshold, len(comps))
+    log.info("%s | TOTAL score=%+.3f (threshold ±%.2f) from %d factors [%s]",
+             symbol, total, cfg.signal_threshold, len(comps), regime)
     if abs(total) < cfg.signal_threshold:
         log.info("%s: no signal", symbol)
         return None
 
-    a = atr(md.high, md.low, md.close, cfg.atr_period)
+    a = atr_wilder(md.high, md.low, md.close, cfg.atr_period)
     if not a:
         log.warning("%s: ATR unavailable", symbol)
         return None
     side = "LONG" if total > 0 else "SHORT"
     d, entry = (1 if side == "LONG" else -1), md.close[-1]
-    return Signal(symbol, side, total, entry,
-                  entry - d * a * cfg.sl_atr_mult,
-                  entry + d * a * cfg.tp1_atr_mult,
-                  entry + d * a * cfg.tp2_atr_mult, a, md.source, comps)
+    stop = entry - d * a * cfg.sl_atr_mult
+    sig = Signal(symbol, side, total, entry, stop,
+                 entry + d * a * cfg.tp1_atr_mult,
+                 entry + d * a * cfg.tp2_atr_mult, a, md.source, comps)
+    # ---- risk-based position sizing: risk RISK_PCT% of CAPITAL per trade
+    if cfg.capital_usdt > 0 and abs(entry - stop) > 0:
+        sig.qty = (cfg.capital_usdt * cfg.risk_pct / 100) / abs(entry - stop)
+    return sig
 
 
 # --------------------------------------------------------------------------- #
@@ -550,9 +671,15 @@ class State:
             except Exception as exc:
                 log.error("Could not read state file, starting fresh: %s", exc)
 
-    def in_cooldown(self, symbol: str, side: str, hours: float) -> bool:
+    def in_cooldown(self, symbol: str, side: str, hours: float, flip_factor: float) -> bool:
+        """Same side: full window. Opposite side (flip): short window, so a real
+        reversal is not blocked forever but signal-flicker is still prevented."""
         last = self.data.get(symbol)
-        return bool(last and last["side"] == side and time.time() - last["ts"] < hours * 3600)
+        if not last:
+            return False
+        elapsed = time.time() - last["ts"]
+        limit = hours * 3600 if last["side"] == side else hours * 3600 * flip_factor
+        return elapsed < limit
 
     def record(self, symbol: str, side: str) -> None:
         self.data[symbol] = {"side": side, "ts": time.time()}
@@ -566,6 +693,7 @@ class State:
 
 def format_message(sig: Signal, cfg: Config) -> str:
     icon = "🟢" if sig.side == "LONG" else "🔴"
+    rr1 = abs(sig.tp1 - sig.entry) / abs(sig.entry - sig.stop) if sig.entry != sig.stop else 0
     lines = [
         f"{icon} <b>سیگنال {sig.side} — {html.escape(sig.symbol)}</b>",
         f"منبع: {sig.source} | تایم‌فریم: {cfg.interval}",
@@ -573,9 +701,20 @@ def format_message(sig: Signal, cfg: Config) -> str:
         "",
         f"ورود: <code>{sig.entry:,.4f}</code>",
         f"حد ضرر: <code>{sig.stop:,.4f}</code>",
-        f"هدف ۱: <code>{sig.tp1:,.4f}</code>",
+        f"هدف ۱ (RR≈{rr1:.1f}): <code>{sig.tp1:,.4f}</code>",
         f"هدف ۲: <code>{sig.tp2:,.4f}</code>",
         f"ATR: {sig.atr:,.4f}",
+    ]
+    if sig.qty > 0:
+        notional = sig.qty * sig.entry
+        fee = notional * cfg.taker_fee * 2
+        lines += [
+            "",
+            f"حجم پیشنهادی (ریسک {cfg.risk_pct:g}% از {cfg.capital_usdt:,.0f}): "
+            f"<code>{sig.qty:,.6f}</code> (~{notional:,.1f} USDT)",
+            f"کارمزد تقریبی رفت‌وبرگشت (taker×۲): ~{fee:,.2f} USDT",
+        ]
+    lines += [
         "",
         "<b>فاکتورها:</b>",
     ]
@@ -615,8 +754,9 @@ def run_cycle(providers: list[Provider], state: State, cfg: Config, dry_run: boo
             sig = evaluate(symbol, providers, cfg)
             if not sig:
                 continue
-            if state.in_cooldown(symbol, sig.side, cfg.cooldown_hours):
-                log.info("%s: %s signal suppressed (cooldown %.1fh)", symbol, sig.side, cfg.cooldown_hours)
+            if state.in_cooldown(symbol, sig.side, cfg.cooldown_hours, cfg.flip_cooldown_factor):
+                log.info("%s: %s signal suppressed (cooldown %.1fh, flip factor %.2f)",
+                         symbol, sig.side, cfg.cooldown_hours, cfg.flip_cooldown_factor)
                 continue
             if send_telegram(format_message(sig, cfg), cfg, dry_run):
                 state.record(symbol, sig.side)
@@ -628,7 +768,7 @@ def run_cycle(providers: list[Provider], state: State, cfg: Config, dry_run: boo
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Free derivatives signal bot")
+    ap = argparse.ArgumentParser(description="Free derivatives signal bot v2")
     ap.add_argument("--once", action="store_true", help="run a single cycle and exit")
     ap.add_argument("--dry-run", action="store_true", help="log signals instead of sending to Telegram")
     ap.add_argument("--symbols", help="comma-separated override, e.g. BTCUSDT,SOLUSDT")
@@ -645,8 +785,8 @@ def main() -> int:
     if unknown:
         log.error("Unknown provider(s): %s (available: %s)", unknown, list(PROVIDERS))
         return 2
-    log.info("Starting bot | symbols=%s providers=%s interval=%s dry_run=%s",
-             cfg.symbols, cfg.providers, cfg.interval, args.dry_run)
+    log.info("Starting bot v2 | symbols=%s providers=%s interval=%s dry_run=%s capital=%.0f risk=%.2f%%",
+             cfg.symbols, cfg.providers, cfg.interval, args.dry_run, cfg.capital_usdt, cfg.risk_pct)
 
     stop = threading.Event()
     for s in (signal.SIGINT, signal.SIGTERM):
